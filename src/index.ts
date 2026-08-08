@@ -11,15 +11,30 @@
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  rmdirSync,
+  writeFileSync,
+} from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-const SESSIONS_DIR = join(homedir(), ".claude", "sessions");
 const PROBE_TIMEOUT_MS = 250;
 const MAX_PEER_FRAME_BYTES = 1_048_576;
+
+function resolveSessionsDir(): string {
+  const configDirectory = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
+  return join(configDirectory, "sessions");
+}
 
 type SessionRecord = {
   pid: number;
@@ -28,8 +43,8 @@ type SessionRecord = {
   name: string;
   status: string;
   messagingSocketPath: string;
-  peerProtocol?: number;
-  startedAt?: number;
+  peerProtocol: number | undefined;
+  startedAt: number | undefined;
 };
 
 type PeerFrame = {
@@ -52,7 +67,7 @@ function resolveSocketDir(): string {
 function readRecords(): SessionRecord[] {
   let files: string[];
   try {
-    files = readdirSync(SESSIONS_DIR);
+    files = readdirSync(resolveSessionsDir());
   } catch {
     return [];
   }
@@ -60,7 +75,9 @@ function readRecords(): SessionRecord[] {
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
     try {
-      const record = JSON.parse(readFileSync(join(SESSIONS_DIR, file), "utf8")) as SessionRecord;
+      const record = JSON.parse(
+        readFileSync(join(resolveSessionsDir(), file), "utf8"),
+      ) as SessionRecord;
       if (typeof record.messagingSocketPath === "string") records.push(record);
     } catch {
       // A session record mid-write is not worth failing discovery over.
@@ -150,39 +167,275 @@ export default function piBridge(pi: ExtensionAPI): void {
   let selfAddress = "";
   let sessionId = "";
   let startedAt = 0;
-  let server: Server | undefined;
-  const connections = new Set<Socket>();
   const name = `pi-${basename(process.cwd()).replace(/[^A-Za-z0-9_-]/g, "-")}-${pid}`.slice(0, 80);
   let streaming = false;
   let toolsRegistered = false;
 
-  const writeRecord = (status: string) => {
-    if (!server) return;
-    try {
-      writeFileSync(
-        recordPath,
-        JSON.stringify({
-          pid,
-          sessionId,
-          cwd: process.cwd(),
-          startedAt,
-          procStart: new Date(startedAt).toString(),
-          version: `pi-${process.env.PI_VERSION ?? "0.84.0"}`,
-          peerProtocol: 1,
-          kind: "interactive",
-          entrypoint: "cli",
-          messagingSocketPath: socketPath,
-          name,
-          nameSource: "derived",
-          status,
-          updatedAt: Date.now(),
-          statusUpdatedAt: Date.now(),
-        }),
-      );
-    } catch {
-      // Losing a status update is not worth interrupting the session.
-    }
-  };
+  const runtime = (() => {
+    let server: Server | undefined;
+    const connections = new Set<Socket>();
+    let running = false;
+    let recordPublished = false;
+    let socketIdentity: { device: number; inode: number } | undefined;
+    let degradationWarned = false;
+
+    const createRecord = (status: "busy" | "idle") => {
+      const now = Date.now();
+      return {
+        pid,
+        sessionId,
+        cwd: process.cwd(),
+        startedAt,
+        procStart: new Date(startedAt).toString(),
+        version: `pi-${process.env.PI_VERSION ?? "0.84.0"}`,
+        peerProtocol: 1,
+        kind: "interactive",
+        entrypoint: "cli",
+        messagingSocketPath: socketPath,
+        name,
+        nameSource: "derived",
+        status,
+        updatedAt: now,
+        statusUpdatedAt: now,
+        _piBridge: { recordVersion: 1 },
+      };
+    };
+
+    const prepareDirectory = (path: string, createdDirectories: string[]) => {
+      const missingDirectories: string[] = [];
+      let cursor = path;
+      while (true) {
+        try {
+          const stat = lstatSync(cursor);
+          if (!stat.isDirectory()) throw new Error(`${cursor} is not a directory`);
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          missingDirectories.push(cursor);
+          const parent = dirname(cursor);
+          if (parent === cursor) throw error;
+          cursor = parent;
+        }
+      }
+
+      for (const missingDirectory of [...missingDirectories].reverse()) {
+        try {
+          mkdirSync(missingDirectory, { mode: 0o700 });
+          createdDirectories.unshift(missingDirectory);
+          chmodSync(missingDirectory, 0o700);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          if (!lstatSync(missingDirectory).isDirectory()) {
+            throw new Error(`${missingDirectory} is not a directory`);
+          }
+        }
+      }
+    };
+
+    const temporaryRecordPath = () =>
+      join(dirname(recordPath), `.${basename(recordPath)}.${randomUUID()}.tmp`);
+
+    const withTemporaryRecord = (
+      status: "busy" | "idle",
+      publish: (temporaryPath: string) => void,
+    ) => {
+      const temporaryPath = temporaryRecordPath();
+      try {
+        writeFileSync(temporaryPath, JSON.stringify(createRecord(status)), {
+          encoding: "utf8",
+          flag: "wx",
+          mode: 0o600,
+        });
+        chmodSync(temporaryPath, 0o600);
+        publish(temporaryPath);
+      } finally {
+        rmSync(temporaryPath, { force: true });
+      }
+    };
+
+    const publishInitialRecord = () => {
+      withTemporaryRecord("idle", (temporaryPath) => {
+        linkSync(temporaryPath, recordPath);
+        recordPublished = true;
+      });
+    };
+
+    const rewriteRecord = (status: "busy" | "idle") => {
+      withTemporaryRecord(status, (temporaryPath) => renameSync(temporaryPath, recordPath));
+    };
+
+    const closeServer = async () => {
+      const currentServer = server;
+      if (!currentServer?.listening) return;
+      await new Promise<void>((resolve) => currentServer.close(() => resolve()));
+    };
+
+    const removeOwnedRecord = () => {
+      if (!recordPublished) return;
+      try {
+        const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+          sessionId: unknown;
+          _piBridge: { recordVersion: unknown } | undefined;
+        };
+        if (record.sessionId !== sessionId || record._piBridge?.recordVersion !== 1) return;
+        rmSync(recordPath);
+      } catch {
+        // Leave anything whose ownership cannot be proven.
+      }
+    };
+
+    const removeOwnedSocket = () => {
+      if (!socketIdentity) return;
+      try {
+        const stat = lstatSync(socketPath);
+        if (stat.dev !== socketIdentity.device || stat.ino !== socketIdentity.inode) return;
+        rmSync(socketPath);
+      } catch {
+        // The socket may already have been removed.
+      }
+    };
+
+    const reset = () => {
+      server = undefined;
+      running = false;
+      recordPublished = false;
+      socketIdentity = undefined;
+      degradationWarned = false;
+    };
+
+    const stop = async () => {
+      for (const connection of connections) connection.destroy();
+      connections.clear();
+      await closeServer();
+      removeOwnedRecord();
+      removeOwnedSocket();
+      reset();
+    };
+
+    const rollback = async (createdDirectories: string[]) => {
+      await stop();
+      for (const path of createdDirectories) {
+        try {
+          rmdirSync(path);
+        } catch {
+          // Keep pre-existing or now non-empty directories.
+        }
+      }
+    };
+
+    const start = async (ctx: ExtensionContext) => {
+      if (running) return;
+      const createdDirectories: string[] = [];
+      try {
+        const sessionsDir = resolveSessionsDir();
+        prepareDirectory(sessionsDir, createdDirectories);
+        const socketDir = resolveSocketDir();
+        prepareDirectory(socketDir, createdDirectories);
+
+        socketPath = join(socketDir, `${pid}.sock`);
+        recordPath = join(sessionsDir, `${pid}.json`);
+        selfAddress = `uds:${socketPath}`;
+        sessionId = randomUUID();
+        startedAt = Date.now();
+
+        const nextServer = createServer({ allowHalfOpen: true }, (connection) => {
+          connections.add(connection);
+          let pendingFrame = Buffer.alloc(0);
+          let rejected = false;
+
+          const rejectOversizedFrame = () => {
+            if (rejected) return;
+            rejected = true;
+            pendingFrame = Buffer.alloc(0);
+            ctx.ui.notify(
+              `pi-bridge: peer frame exceeds ${MAX_PEER_FRAME_BYTES} byte limit`,
+              "warning",
+            );
+            connection.destroy();
+          };
+
+          const appendToPendingFrame = (bytes: Buffer): boolean => {
+            const nextLength = pendingFrame.length + bytes.length;
+            if (nextLength > MAX_PEER_FRAME_BYTES) {
+              rejectOversizedFrame();
+              return false;
+            }
+            if (bytes.length === 0) return true;
+            pendingFrame =
+              pendingFrame.length === 0
+                ? Buffer.from(bytes)
+                : Buffer.concat([pendingFrame, bytes], nextLength);
+            return true;
+          };
+
+          const processPendingFrame = () => {
+            const line = pendingFrame.toString("utf8");
+            pendingFrame = Buffer.alloc(0);
+            if (line.trim()) handleLine(line, ctx);
+          };
+
+          connection.on("data", (chunk) => {
+            let offset = 0;
+            while (offset < chunk.length && !rejected) {
+              const newlineIndex = chunk.indexOf(0x0a, offset);
+              if (newlineIndex === -1) {
+                appendToPendingFrame(chunk.subarray(offset));
+                return;
+              }
+
+              if (!appendToPendingFrame(chunk.subarray(offset, newlineIndex))) return;
+              processPendingFrame();
+              offset = newlineIndex + 1;
+            }
+          });
+          connection.on("end", () => {
+            if (rejected) return;
+            if (pendingFrame.length > 0) processPendingFrame();
+            connection.end();
+          });
+          connection.on("close", () => connections.delete(connection));
+          connection.on("error", () => connections.delete(connection));
+        });
+        server = nextServer;
+
+        await new Promise<void>((resolve, reject) => {
+          const handleStartupError = (error: Error) => reject(error);
+          nextServer.once("error", handleStartupError);
+          nextServer.listen(socketPath, () => {
+            nextServer.off("error", handleStartupError);
+            resolve();
+          });
+        });
+
+        const socketStat = lstatSync(socketPath);
+        socketIdentity = { device: socketStat.dev, inode: socketStat.ino };
+        chmodSync(socketPath, 0o600);
+        nextServer.unref();
+        nextServer.on("error", (error) =>
+          ctx.ui.notify(`pi-bridge: server error: ${error.message}`, "error"),
+        );
+        publishInitialRecord();
+        running = true;
+      } catch (error) {
+        await rollback(createdDirectories);
+        throw error;
+      }
+    };
+
+    const updateStatus = (status: "busy" | "idle", ctx: ExtensionContext) => {
+      if (!running) return;
+      try {
+        rewriteRecord(status);
+      } catch (error) {
+        if (degradationWarned) return;
+        degradationWarned = true;
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`pi-bridge: session status updates degraded: ${message}`, "warning");
+      }
+    };
+
+    return { start, updateStatus, stop };
+  })();
 
   const deliver = (content: string, ctx: ExtensionContext) => {
     // sendUserMessage throws when the agent is mid-stream unless told how to queue.
@@ -219,106 +472,6 @@ export default function piBridge(pi: ExtensionAPI): void {
     // Claude wraps the body in <cross-session-message from="uds:..."> already, which
     // carries the reply address the send_message tool needs. Pass it through intact.
     deliver(content, ctx);
-  };
-
-  const startServer = (ctx: ExtensionContext) => {
-    if (server) return;
-    const socketDir = resolveSocketDir();
-    socketPath = join(socketDir, `${pid}.sock`);
-    recordPath = join(SESSIONS_DIR, `${pid}.json`);
-    selfAddress = `uds:${socketPath}`;
-    sessionId = randomUUID();
-    startedAt = Date.now();
-
-    mkdirSync(socketDir, { recursive: true, mode: 0o700 });
-    try {
-      rmSync(socketPath);
-    } catch {
-      // No stale socket to clear.
-    }
-
-    server = createServer({ allowHalfOpen: true }, (conn) => {
-      connections.add(conn);
-      let pendingFrame = Buffer.alloc(0);
-      let rejected = false;
-
-      const rejectOversizedFrame = () => {
-        if (rejected) return;
-        rejected = true;
-        pendingFrame = Buffer.alloc(0);
-        ctx.ui.notify(
-          `pi-bridge: peer frame exceeds ${MAX_PEER_FRAME_BYTES} byte limit`,
-          "warning",
-        );
-        conn.destroy();
-      };
-
-      const appendToPendingFrame = (bytes: Buffer): boolean => {
-        const nextLength = pendingFrame.length + bytes.length;
-        if (nextLength > MAX_PEER_FRAME_BYTES) {
-          rejectOversizedFrame();
-          return false;
-        }
-        if (bytes.length === 0) return true;
-        pendingFrame =
-          pendingFrame.length === 0
-            ? Buffer.from(bytes)
-            : Buffer.concat([pendingFrame, bytes], nextLength);
-        return true;
-      };
-
-      const processPendingFrame = () => {
-        const line = pendingFrame.toString("utf8");
-        pendingFrame = Buffer.alloc(0);
-        if (line.trim()) handleLine(line, ctx);
-      };
-
-      conn.on("data", (chunk) => {
-        let offset = 0;
-        while (offset < chunk.length && !rejected) {
-          const newlineIndex = chunk.indexOf(0x0a, offset);
-          if (newlineIndex === -1) {
-            appendToPendingFrame(chunk.subarray(offset));
-            return;
-          }
-
-          if (!appendToPendingFrame(chunk.subarray(offset, newlineIndex))) return;
-          processPendingFrame();
-          offset = newlineIndex + 1;
-        }
-      });
-      conn.on("end", () => {
-        if (rejected) return;
-        if (pendingFrame.length > 0) processPendingFrame();
-        conn.end();
-      });
-      conn.on("close", () => connections.delete(conn));
-      conn.on("error", () => connections.delete(conn));
-    });
-    server.on("error", (error) =>
-      ctx.ui.notify(`pi-bridge: server error: ${error.message}`, "error"),
-    );
-    server.listen(socketPath, () => {
-      chmodSync(socketPath, 0o600);
-      server?.unref();
-      writeRecord("idle");
-      ctx.ui.setStatus("pi-bridge", `peer: ${name}`);
-    });
-  };
-
-  const stopServer = () => {
-    if (!server) return;
-    for (const conn of connections) conn.destroy();
-    connections.clear();
-    server?.close();
-    server = undefined;
-    for (const path of [socketPath, recordPath]) {
-      try {
-        rmSync(path);
-      } catch {
-        // Already gone.
-      }
-    }
   };
 
   const registerTools = () => {
@@ -407,18 +560,22 @@ export default function piBridge(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     if (!pi.getFlag("bridge")) return;
-    registerTools();
-    startServer(ctx);
+    try {
+      await runtime.start(ctx);
+      registerTools();
+      ctx.ui.setStatus("pi-bridge", `peer: ${name}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`pi-bridge: startup failed, bridge disabled: ${message}`, "error");
+    }
   });
-  pi.on("session_shutdown", async () => stopServer());
-  pi.on("agent_start", async () => {
-    if (!server) return;
+  pi.on("session_shutdown", async () => runtime.stop());
+  pi.on("agent_start", async (_event, ctx) => {
     streaming = true;
-    writeRecord("busy");
+    runtime.updateStatus("busy", ctx);
   });
-  pi.on("agent_settled", async () => {
-    if (!server) return;
+  pi.on("agent_settled", async (_event, ctx) => {
     streaming = false;
-    writeRecord("idle");
+    runtime.updateStatus("idle", ctx);
   });
 }
