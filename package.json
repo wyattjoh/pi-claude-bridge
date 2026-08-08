@@ -1,0 +1,42 @@
+{
+  "name": "@wyattjoh/pi-cc-socket",
+  "version": "0.1.0",
+  "description": "Opt-in Pi extension for Claude Code peer messaging over a Unix socket",
+  "type": "module",
+  "license": "MIT",
+  "author": "Wyatt Johnson",
+  "keywords": ["pi-package", "pi-extension", "claude-code", "peer-messaging"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wyattjoh/pi-cc-socket.git"
+  },
+  "homepage": "https://github.com/wyattjoh/pi-cc-socket#readme",
+  "bugs": {
+    "url": "https://github.com/wyattjoh/pi-cc-socket/issues"
+  },
+  "files": ["src", "README.md", "LICENSE"],
+  "packageManager": "bun@1.3.14",
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun test",
+    "prepublishOnly": "bun run check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@types/bun": "1.3.14",
+    "@types/node": "24.12.4",
+    "typebox": "1.3.7",
+    "typescript": "5.9.3"
+  }
+}
