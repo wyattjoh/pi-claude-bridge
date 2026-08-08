@@ -25,9 +25,17 @@ type FlagDefinition = {
   type: string;
 };
 
+type ToolResult = {
+  content: Array<{ type: string; text: string }>;
+  details: unknown;
+};
+
 type ToolDefinition = {
   name: string;
-  execute: (...args: never[]) => Promise<unknown>;
+  execute: (
+    toolCallId: string | undefined,
+    params: { to: string; message: string } | undefined,
+  ) => Promise<ToolResult>;
 };
 
 type TestPaths = {
@@ -125,6 +133,42 @@ function closeServer(server: Server): Promise<void> {
   return new Promise((resolve, reject) =>
     server.close((error) => (error ? reject(error) : resolve())),
   );
+}
+
+async function listenPeerServer(
+  socketPath: string,
+): Promise<{ server: Server; waitForFrame: () => Promise<Record<string, unknown>> }> {
+  mkdirSync(join(socketPath, ".."), { recursive: true });
+  const frames: Record<string, unknown>[] = [];
+  const listeners: Array<(frame: Record<string, unknown>) => void> = [];
+  const server = createServer((socket) => {
+    let pending = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      pending += chunk;
+      const newlineIndex = pending.indexOf("\n");
+      if (newlineIndex === -1) return;
+      const frame = JSON.parse(pending.slice(0, newlineIndex)) as Record<string, unknown>;
+      frames.push(frame);
+      listeners.shift()?.(frame);
+    });
+    socket.on("end", () => socket.end());
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  return {
+    server,
+    waitForFrame() {
+      const existing = frames.shift();
+      if (existing) return Promise.resolve(existing);
+      return new Promise((resolve) => listeners.push(resolve));
+    },
+  };
 }
 
 function writeOwnedRecord(recordPath: string, socketPath: string): string {
@@ -318,6 +362,167 @@ describe("pi-bridge opt-in", () => {
       await harness.fire("session_shutdown");
       expect(existsSync(socketPath)).toBe(false);
       expect(existsSync(recordPath)).toBe(false);
+    });
+  });
+
+  test.serial(
+    "supports discovery, bidirectional messaging, statuses, and shutdown over real sockets",
+    async () => {
+      await withTestPaths(async ({ root, sessionsDir }) => {
+        mkdirSync(sessionsDir, { recursive: true });
+        const peerDirectory = join(root, "peer-sockets");
+        const nativeSocketPath = join(peerDirectory, "native.sock");
+        const markedSocketPath = join(peerDirectory, "marked.sock");
+        const nativePeer = await listenPeerServer(nativeSocketPath);
+        const markedPeer = await listenPeerServer(markedSocketPath);
+        const nativeRecordPath = join(sessionsDir, "native.json");
+        const markedRecordPath = join(sessionsDir, "marked.json");
+        writeFileSync(
+          nativeRecordPath,
+          JSON.stringify({
+            pid: process.pid + 1,
+            sessionId: "a1b2c3d4-native",
+            cwd: join(root, "native-project"),
+            name: "native-peer",
+            status: "idle",
+            messagingSocketPath: nativeSocketPath,
+          }),
+        );
+        writeFileSync(
+          markedRecordPath,
+          JSON.stringify({
+            pid: process.pid + 2,
+            sessionId: "d4c3b2a1-marked",
+            cwd: join(root, "marked-project"),
+            name: "marked-peer",
+            status: "busy",
+            messagingSocketPath: markedSocketPath,
+            _piBridge: { recordVersion: 1 },
+          }),
+        );
+
+        try {
+          const harness = createHarness(true);
+          piBridge(harness.pi as never);
+          await harness.fire("session_start");
+
+          const ownRecordPath = join(sessionsDir, `${process.pid}.json`);
+          const ownRecord = JSON.parse(readFileSync(ownRecordPath, "utf8")) as {
+            messagingSocketPath: string;
+            status: string;
+          };
+          const listAgents = harness.tools.find((tool) => tool.name === "list_agents");
+          const listing = await listAgents?.execute(undefined, undefined);
+          expect(listing?.content[0]?.text).toContain("native-peer [a1b2c3]");
+          expect(listing?.content[0]?.text).toContain("marked-peer [d4c3b2]");
+
+          const sendMessage = harness.tools.find((tool) => tool.name === "send_message");
+          const nativeFramePromise = nativePeer.waitForFrame();
+          await sendMessage?.execute("native-call", {
+            to: "native-peer",
+            message: "hello native",
+          });
+          const nativeFrame = await nativeFramePromise;
+          expect(nativeFrame.type).toBe("user");
+          expect(nativeFrame.message).toMatchObject({
+            content: expect.stringContaining("hello native"),
+            role: "user",
+          });
+
+          const markedFramePromise = markedPeer.waitForFrame();
+          await sendMessage?.execute("marked-call", {
+            to: "marked-peer [d4c3b2]",
+            message: "hello marked",
+          });
+          expect(await markedFramePromise).toMatchObject({ type: "user" });
+
+          await harness.fire("agent_start");
+          expect(JSON.parse(readFileSync(ownRecordPath, "utf8")).status).toBe("busy");
+          const busyMessage = harness.waitForUserMessage();
+          await sendSocketBytes(
+            ownRecord.messagingSocketPath,
+            `${peerFrame("incoming while busy")}\n`,
+          );
+          expect(await busyMessage).toEqual({
+            content: "incoming while busy",
+            options: { deliverAs: "followUp" },
+          });
+
+          harness.userMessages.length = 0;
+          await harness.fire("agent_settled");
+          expect(JSON.parse(readFileSync(ownRecordPath, "utf8")).status).toBe("idle");
+          const idleMessage = harness.waitForUserMessage();
+          await sendSocketBytes(
+            ownRecord.messagingSocketPath,
+            `${peerFrame("incoming while idle")}\n`,
+          );
+          expect(await idleMessage).toEqual({
+            content: "incoming while idle",
+            options: undefined,
+          });
+
+          await harness.fire("session_shutdown");
+          await harness.fire("session_shutdown");
+          expect(existsSync(ownRecordPath)).toBe(false);
+          expect(existsSync(ownRecord.messagingSocketPath)).toBe(false);
+          expect(existsSync(nativeRecordPath)).toBe(true);
+          expect(existsSync(markedRecordPath)).toBe(true);
+        } finally {
+          await closeServer(nativePeer.server);
+          await closeServer(markedPeer.server);
+        }
+      });
+    },
+  );
+
+  test.serial("preserves an identical replacement at its published record path", async () => {
+    await withTestPaths(async ({ sessionsDir }) => {
+      const harness = createHarness(true);
+      piBridge(harness.pi as never);
+      await harness.fire("session_start");
+
+      const recordPath = join(sessionsDir, `${process.pid}.json`);
+      const originalContents = readFileSync(recordPath, "utf8");
+      rmSync(recordPath);
+      writeFileSync(recordPath, originalContents, { mode: 0o600 });
+      const replacementIdentity = statSync(recordPath);
+
+      await harness.fire("session_shutdown");
+
+      expect(readFileSync(recordPath, "utf8")).toBe(originalContents);
+      expect(statSync(recordPath)).toMatchObject({
+        dev: replacementIdentity.dev,
+        ino: replacementIdentity.ino,
+      });
+    });
+  });
+
+  test.serial("preserves a live replacement at its published socket path", async () => {
+    await withTestPaths(async ({ sessionsDir }) => {
+      const harness = createHarness(true);
+      piBridge(harness.pi as never);
+      await harness.fire("session_start");
+
+      const record = JSON.parse(readFileSync(join(sessionsDir, `${process.pid}.json`), "utf8")) as {
+        messagingSocketPath: string;
+      };
+      rmSync(record.messagingSocketPath);
+      const replacementServer = await listenUnixServer(record.messagingSocketPath);
+      const replacementIdentity = statSync(record.messagingSocketPath);
+
+      try {
+        await harness.fire("session_shutdown");
+
+        const restoredIdentity = statSync(record.messagingSocketPath);
+        expect(restoredIdentity.isSocket()).toBe(true);
+        expect(restoredIdentity).toMatchObject({
+          dev: replacementIdentity.dev,
+          ino: replacementIdentity.ino,
+        });
+        await sendSocketBytes(record.messagingSocketPath, "");
+      } finally {
+        await closeServer(replacementServer);
+      }
     });
   });
 
@@ -537,7 +742,7 @@ describe("pi-bridge opt-in", () => {
       writeOwnedRecord(recordPath, join(root, "missing.sock"));
 
       const listAgents = harness.tools.find((tool) => tool.name === "list_agents");
-      await listAgents?.execute();
+      await listAgents?.execute(undefined, undefined);
 
       expect(existsSync(recordPath)).toBe(true);
       await harness.fire("session_shutdown");

@@ -96,12 +96,20 @@ type BridgeOptions = {
   connectSocket: SocketConnector | undefined;
 };
 
-type RecordIdentity = {
+type PathIdentity = {
   device: number;
   inode: number;
+};
+
+type RecordIdentity = PathIdentity & {
   size: number;
   modifiedAt: number;
   changedAt: number;
+};
+
+type PreservedSocketReplacement = {
+  path: string;
+  identity: PathIdentity;
 };
 
 type OwnedRecordCandidate = {
@@ -327,7 +335,8 @@ export default function piBridge(
     const connections = new Set<Socket>();
     let running = false;
     let recordPublished = false;
-    let socketIdentity: { device: number; inode: number } | undefined;
+    let ownedRecordIdentity: RecordIdentity | undefined;
+    let socketIdentity: PathIdentity | undefined;
     let degradationWarned = false;
 
     const createRecord = (status: "busy" | "idle") => {
@@ -404,15 +413,32 @@ export default function piBridge(
       }
     };
 
+    const capturePublishedRecordIdentity = (temporaryStat: Stats) => {
+      const publishedStat = lstatSync(recordPath);
+      ownedRecordIdentity =
+        publishedStat.isFile() &&
+        publishedStat.dev === temporaryStat.dev &&
+        publishedStat.ino === temporaryStat.ino
+          ? recordIdentity(publishedStat)
+          : undefined;
+    };
+
     const publishInitialRecord = () => {
       withTemporaryRecord("idle", (temporaryPath) => {
+        const temporaryStat = lstatSync(temporaryPath);
         linkSync(temporaryPath, recordPath);
         recordPublished = true;
+        unlinkSync(temporaryPath);
+        capturePublishedRecordIdentity(temporaryStat);
       });
     };
 
     const rewriteRecord = (status: "busy" | "idle") => {
-      withTemporaryRecord(status, (temporaryPath) => renameSync(temporaryPath, recordPath));
+      withTemporaryRecord(status, (temporaryPath) => {
+        const temporaryStat = lstatSync(temporaryPath);
+        renameSync(temporaryPath, recordPath);
+        capturePublishedRecordIdentity(temporaryStat);
+      });
     };
 
     const closeServer = async () => {
@@ -422,27 +448,70 @@ export default function piBridge(
     };
 
     const removeOwnedRecord = () => {
-      if (!recordPublished) return;
+      if (!recordPublished || !ownedRecordIdentity) return;
       try {
+        const before = lstatSync(recordPath);
+        if (!before.isFile() || !isSameRecord(recordIdentity(before), ownedRecordIdentity)) return;
         const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
           sessionId: unknown;
           _piBridge: { recordVersion: unknown } | undefined;
         };
+        const after = lstatSync(recordPath);
+        if (!after.isFile() || !isSameRecord(recordIdentity(after), ownedRecordIdentity)) return;
         if (record.sessionId !== sessionId || record._piBridge?.recordVersion !== 1) return;
-        rmSync(recordPath);
+        unlinkSync(recordPath);
       } catch {
         // Leave anything whose ownership cannot be proven.
       }
     };
 
-    const removeOwnedSocket = () => {
-      if (!socketIdentity) return;
+    const prepareSocketShutdown = (): PreservedSocketReplacement | undefined => {
+      if (!socketIdentity) return undefined;
       try {
         const stat = lstatSync(socketPath);
-        if (stat.dev !== socketIdentity.device || stat.ino !== socketIdentity.inode) return;
-        rmSync(socketPath);
+        if (
+          stat.isSocket() &&
+          stat.dev === socketIdentity.device &&
+          stat.ino === socketIdentity.inode
+        ) {
+          unlinkSync(socketPath);
+          return undefined;
+        }
+        if (stat.isDirectory()) return undefined;
+
+        const preservedPath = join(
+          dirname(socketPath),
+          `.${basename(socketPath)}.${randomUUID()}.replacement`,
+        );
+        linkSync(socketPath, preservedPath);
+        return {
+          path: preservedPath,
+          identity: { device: stat.dev, inode: stat.ino },
+        };
       } catch {
-        // The socket may already have been removed.
+        return undefined;
+      }
+    };
+
+    const restoreSocketReplacement = (
+      preservedReplacement: PreservedSocketReplacement | undefined,
+    ) => {
+      if (!preservedReplacement) return;
+      try {
+        linkSync(preservedReplacement.path, socketPath);
+        unlinkSync(preservedReplacement.path);
+      } catch {
+        try {
+          const current = lstatSync(socketPath);
+          if (
+            current.dev === preservedReplacement.identity.device &&
+            current.ino === preservedReplacement.identity.inode
+          ) {
+            unlinkSync(preservedReplacement.path);
+          }
+        } catch {
+          // Keep the replacement's hard link rather than deleting it.
+        }
       }
     };
 
@@ -450,6 +519,7 @@ export default function piBridge(
       server = undefined;
       running = false;
       recordPublished = false;
+      ownedRecordIdentity = undefined;
       socketIdentity = undefined;
       degradationWarned = false;
     };
@@ -457,9 +527,10 @@ export default function piBridge(
     const stop = async () => {
       for (const connection of connections) connection.destroy();
       connections.clear();
+      const preservedSocketReplacement = prepareSocketShutdown();
       await closeServer();
+      restoreSocketReplacement(preservedSocketReplacement);
       removeOwnedRecord();
-      removeOwnedSocket();
       reset();
     };
 

@@ -7,7 +7,6 @@ opt-in Pi session to Claude Code peer messaging.
 
 ## Development
 
-- Use Bun for dependency installation and tests.
-- Keep the Pi package entrypoint at `src/index.ts` and its focused test beside it.
-- Preserve the opt-in boundary: peer discovery, tools, sockets, and session records start only after `--bridge` is enabled.
-- Run `bun run check` before considering changes complete.
+- Preserve the opt-in boundary: peer discovery, tools, sockets, session records, and stale-record cleanup start only after `--bridge` is enabled.
+- Test lifecycle behavior through temporary configuration and runtime directories, never the developer's real home or Claude state.
+- Treat the standard project check and a package dry run as completion gates.
