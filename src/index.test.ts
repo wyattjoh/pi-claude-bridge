@@ -7,9 +7,10 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { connect } from "node:net";
+import { connect, createServer, type Server, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import piBridge from "./index.ts";
@@ -106,6 +107,33 @@ function sendSocketBytes(socketPath: string, bytes: string): Promise<void> {
     socket.on("close", () => resolve());
     socket.on("error", reject);
   });
+}
+
+function listenUnixServer(socketPath: string): Promise<Server> {
+  mkdirSync(join(socketPath, ".."), { recursive: true });
+  const server = createServer((socket) => socket.destroy());
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, () => {
+      server.off("error", reject);
+      resolve(server);
+    });
+  });
+}
+
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+}
+
+function writeOwnedRecord(recordPath: string, socketPath: string): string {
+  const contents = JSON.stringify({
+    messagingSocketPath: socketPath,
+    _piBridge: { recordVersion: 1 },
+  });
+  writeFileSync(recordPath, contents);
+  return contents;
 }
 
 function peerFrame(content: string): string {
@@ -230,6 +258,21 @@ describe("pi-bridge opt-in", () => {
     });
   });
 
+  test.serial("does not reap marked records while the bridge is disabled", async () => {
+    await withTestPaths(async ({ root, sessionsDir }) => {
+      mkdirSync(sessionsDir, { recursive: true });
+      const recordPath = join(sessionsDir, "stale.json");
+      writeOwnedRecord(recordPath, join(root, "missing.sock"));
+      const harness = createHarness();
+      piBridge(harness.pi as never);
+
+      await harness.fire("session_start");
+
+      expect(existsSync(recordPath)).toBe(true);
+      expect(harness.tools).toEqual([]);
+    });
+  });
+
   test.serial("publishes a secured idle peer before exposing tools", async () => {
     await withTestPaths(async ({ sessionsDir, socketDir }) => {
       const socketPath = join(socketDir, `${process.pid}.sock`);
@@ -275,6 +318,229 @@ describe("pi-bridge opt-in", () => {
       await harness.fire("session_shutdown");
       expect(existsSync(socketPath)).toBe(false);
       expect(existsSync(recordPath)).toBe(false);
+    });
+  });
+
+  test.serial("reaps an unchanged marked record before selecting a socket directory", async () => {
+    await withTestPaths(async ({ sessionsDir, socketDir }) => {
+      mkdirSync(sessionsDir, { recursive: true });
+      const staleRecordPath = join(sessionsDir, "stale.json");
+      writeOwnedRecord(staleRecordPath, join(sessionsDir, "missing.sock"));
+      const harness = createHarness(true, () => {
+        expect(existsSync(staleRecordPath)).toBe(false);
+      });
+      piBridge(harness.pi as never);
+
+      await harness.fire("session_start");
+
+      const ownRecord = JSON.parse(
+        readFileSync(join(sessionsDir, `${process.pid}.json`), "utf8"),
+      ) as { messagingSocketPath: string };
+      expect(existsSync(staleRecordPath)).toBe(false);
+      expect(ownRecord.messagingSocketPath).toBe(join(socketDir, `${process.pid}.sock`));
+      await harness.fire("session_shutdown");
+    });
+  });
+
+  test.serial("removes only the stale record and never its advertised path", async () => {
+    await withTestPaths(async ({ root, sessionsDir }) => {
+      mkdirSync(sessionsDir, { recursive: true });
+      const advertisedPath = join(root, "unrelated-resource");
+      writeFileSync(advertisedPath, "keep me");
+      const recordPath = join(sessionsDir, "stale.json");
+      writeOwnedRecord(recordPath, advertisedPath);
+      const harness = createHarness(true);
+      piBridge(harness.pi as never, {
+        connectSocket() {
+          const socket = new Socket();
+          setImmediate(() =>
+            socket.emit("error", Object.assign(new Error("missing"), { code: "ENOENT" })),
+          );
+          return socket;
+        },
+      });
+
+      await harness.fire("session_start");
+
+      expect(existsSync(recordPath)).toBe(false);
+      expect(readFileSync(advertisedPath, "utf8")).toBe("keep me");
+      await harness.fire("session_shutdown");
+    });
+  });
+
+  test.serial("retains a marked record whose socket is reachable", async () => {
+    await withTestPaths(async ({ root, sessionsDir }) => {
+      mkdirSync(sessionsDir, { recursive: true });
+      const liveSocketPath = join(root, "probe", "live.sock");
+      const liveRecordPath = join(sessionsDir, "live.json");
+      const liveServer = await listenUnixServer(liveSocketPath);
+      writeOwnedRecord(liveRecordPath, liveSocketPath);
+
+      try {
+        const harness = createHarness(true);
+        piBridge(harness.pi as never);
+        await harness.fire("session_start");
+
+        expect(existsSync(liveRecordPath)).toBe(true);
+        await harness.fire("session_shutdown");
+      } finally {
+        await closeServer(liveServer);
+      }
+    });
+  });
+
+  test.serial("retains a marked record when its socket probe times out", async () => {
+    await withTestPaths(async ({ root, sessionsDir }) => {
+      mkdirSync(sessionsDir, { recursive: true });
+      const recordPath = join(sessionsDir, "indeterminate.json");
+      writeOwnedRecord(recordPath, join(root, "indeterminate.sock"));
+      const harness = createHarness(true);
+      piBridge(harness.pi as never, {
+        connectSocket() {
+          const socket = new Socket();
+          setImmediate(() => socket.emit("timeout"));
+          return socket;
+        },
+      });
+
+      await harness.fire("session_start");
+
+      expect(existsSync(recordPath)).toBe(true);
+      await harness.fire("session_shutdown");
+    });
+  });
+
+  test.serial("retains records and entries that cannot prove bridge ownership", async () => {
+    await withTestPaths(async ({ root, sessionsDir }) => {
+      mkdirSync(sessionsDir, { recursive: true });
+      const missingSocketPath = join(root, "missing.sock");
+      const retainedPaths = [
+        join(sessionsDir, "native.json"),
+        join(sessionsDir, "unmarked.json"),
+        join(sessionsDir, "malformed.json"),
+        join(sessionsDir, "array.json"),
+        join(sessionsDir, "unknown-version.json"),
+        join(sessionsDir, "extended-marker.json"),
+        join(sessionsDir, "invalid-path.json"),
+        join(sessionsDir, "symlink.json"),
+        join(sessionsDir, "directory.json"),
+        join(sessionsDir, "special.json"),
+      ];
+
+      writeFileSync(
+        retainedPaths[0]!,
+        JSON.stringify({
+          pid: 123,
+          sessionId: "native",
+          messagingSocketPath: missingSocketPath,
+        }),
+      );
+      writeFileSync(retainedPaths[1]!, JSON.stringify({ messagingSocketPath: missingSocketPath }));
+      writeFileSync(retainedPaths[2]!, "{");
+      writeFileSync(
+        retainedPaths[3]!,
+        JSON.stringify([
+          { messagingSocketPath: missingSocketPath, _piBridge: { recordVersion: 1 } },
+        ]),
+      );
+      writeFileSync(
+        retainedPaths[4]!,
+        JSON.stringify({
+          messagingSocketPath: missingSocketPath,
+          _piBridge: { recordVersion: 2 },
+        }),
+      );
+      writeFileSync(
+        retainedPaths[5]!,
+        JSON.stringify({
+          messagingSocketPath: missingSocketPath,
+          _piBridge: { recordVersion: 1, extra: true },
+        }),
+      );
+      writeFileSync(
+        retainedPaths[6]!,
+        JSON.stringify({
+          messagingSocketPath: "relative.sock",
+          _piBridge: { recordVersion: 1 },
+        }),
+      );
+      const symlinkTarget = join(root, "symlink-target.json");
+      writeOwnedRecord(symlinkTarget, missingSocketPath);
+      symlinkSync(symlinkTarget, retainedPaths[7]!);
+      mkdirSync(retainedPaths[8]!);
+      const specialServer = await listenUnixServer(retainedPaths[9]!);
+
+      try {
+        const harness = createHarness(true);
+        piBridge(harness.pi as never);
+        await harness.fire("session_start");
+
+        expect(retainedPaths.map((path) => existsSync(path))).toEqual(
+          retainedPaths.map(() => true),
+        );
+        expect(readFileSync(symlinkTarget, "utf8")).toContain('"recordVersion":1');
+        await harness.fire("session_shutdown");
+      } finally {
+        await closeServer(specialServer);
+      }
+    });
+  });
+
+  test.serial("retains a marked record changed while its socket is probed", async () => {
+    await withTestPaths(async ({ root, sessionsDir }) => {
+      mkdirSync(sessionsDir, { recursive: true });
+      const recordPath = join(sessionsDir, "changed.json");
+      writeOwnedRecord(recordPath, join(root, "missing.sock"));
+      const harness = createHarness(true);
+      piBridge(harness.pi as never);
+
+      const startup = harness.fire("session_start");
+      writeFileSync(
+        recordPath,
+        JSON.stringify({
+          messagingSocketPath: join(root, "missing.sock"),
+          changed: true,
+          _piBridge: { recordVersion: 1 },
+        }),
+      );
+      await startup;
+
+      expect(readFileSync(recordPath, "utf8")).toContain('"changed":true');
+      await harness.fire("session_shutdown");
+    });
+  });
+
+  test.serial("retains a marked record replaced while its socket is probed", async () => {
+    await withTestPaths(async ({ root, sessionsDir }) => {
+      mkdirSync(sessionsDir, { recursive: true });
+      const recordPath = join(sessionsDir, "replaced.json");
+      const originalContents = writeOwnedRecord(recordPath, join(root, "missing.sock"));
+      const harness = createHarness(true);
+      piBridge(harness.pi as never);
+
+      const startup = harness.fire("session_start");
+      rmSync(recordPath);
+      writeFileSync(recordPath, originalContents);
+      await startup;
+
+      expect(readFileSync(recordPath, "utf8")).toBe(originalContents);
+      await harness.fire("session_shutdown");
+    });
+  });
+
+  test.serial("keeps peer listing observational", async () => {
+    await withTestPaths(async ({ root, sessionsDir }) => {
+      const harness = createHarness(true);
+      piBridge(harness.pi as never);
+      await harness.fire("session_start");
+      const recordPath = join(sessionsDir, "stale-after-startup.json");
+      writeOwnedRecord(recordPath, join(root, "missing.sock"));
+
+      const listAgents = harness.tools.find((tool) => tool.name === "list_agents");
+      await listAgents?.execute();
+
+      expect(existsSync(recordPath)).toBe(true);
+      await harness.fire("session_shutdown");
     });
   });
 

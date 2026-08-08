@@ -20,12 +20,14 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  unlinkSync,
   rmdirSync,
+  type Stats,
   writeFileSync,
 } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const PROBE_TIMEOUT_MS = 250;
@@ -86,17 +88,160 @@ function readRecords(): SessionRecord[] {
   return records;
 }
 
-function isLive(socketPath: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const probe = connect({ path: socketPath });
-    const settle = (alive: boolean) => {
-      probe.destroy();
-      resolve(alive);
+type SocketProbeOutcome = "reachable" | "unreachable" | "indeterminate";
+
+type SocketConnector = (options: { path: string }) => Socket;
+
+type BridgeOptions = {
+  connectSocket: SocketConnector | undefined;
+};
+
+type RecordIdentity = {
+  device: number;
+  inode: number;
+  size: number;
+  modifiedAt: number;
+  changedAt: number;
+};
+
+type OwnedRecordCandidate = {
+  path: string;
+  contents: string;
+  socketPath: string;
+  identity: RecordIdentity;
+};
+
+function recordIdentity(stat: Stats): RecordIdentity {
+  return {
+    device: stat.dev,
+    inode: stat.ino,
+    size: stat.size,
+    modifiedAt: stat.mtimeMs,
+    changedAt: stat.ctimeMs,
+  };
+}
+
+function isSameRecord(left: RecordIdentity, right: RecordIdentity): boolean {
+  return (
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.size === right.size &&
+    left.modifiedAt === right.modifiedAt &&
+    left.changedAt === right.changedAt
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOwnershipMarker(record: Record<string, unknown>): boolean {
+  const marker = record._piBridge;
+  return isRecord(marker) && Object.keys(marker).length === 1 && marker.recordVersion === 1;
+}
+
+function readOwnedRecordCandidate(path: string): OwnedRecordCandidate | undefined {
+  try {
+    const before = lstatSync(path);
+    if (!before.isFile()) return undefined;
+    const beforeIdentity = recordIdentity(before);
+
+    const contents = readFileSync(path, "utf8");
+    const after = lstatSync(path);
+    if (!after.isFile()) return undefined;
+    const afterIdentity = recordIdentity(after);
+    if (!isSameRecord(beforeIdentity, afterIdentity)) return undefined;
+
+    const record: unknown = JSON.parse(contents);
+    if (!isRecord(record) || !hasOwnershipMarker(record)) return undefined;
+
+    const socketPath = record.messagingSocketPath;
+    if (typeof socketPath !== "string" || !isAbsolute(socketPath) || socketPath.includes("\0")) {
+      return undefined;
+    }
+
+    return {
+      path,
+      contents,
+      socketPath,
+      identity: afterIdentity,
     };
-    probe.on("connect", () => settle(true));
-    probe.on("error", () => settle(false));
-    probe.setTimeout(PROBE_TIMEOUT_MS, () => settle(false));
+  } catch {
+    return undefined;
+  }
+}
+
+function probeSocket(
+  socketPath: string,
+  connectSocket: SocketConnector,
+): Promise<SocketProbeOutcome> {
+  return new Promise((resolve) => {
+    let probe: Socket;
+    let settled = false;
+    const settle = (outcome: SocketProbeOutcome) => {
+      if (settled) return;
+      settled = true;
+      probe.destroy();
+      resolve(outcome);
+    };
+
+    try {
+      probe = connectSocket({ path: socketPath });
+    } catch {
+      resolve("indeterminate");
+      return;
+    }
+
+    probe.once("connect", () => settle("reachable"));
+    probe.once("error", (error: NodeJS.ErrnoException) =>
+      settle(
+        error.code === "ENOENT" || error.code === "ECONNREFUSED" ? "unreachable" : "indeterminate",
+      ),
+    );
+    probe.setTimeout(PROBE_TIMEOUT_MS, () => settle("indeterminate"));
   });
+}
+
+async function reapStaleRecords(
+  sessionsDir: string,
+  connectSocket: SocketConnector,
+): Promise<void> {
+  let files;
+  try {
+    files = readdirSync(sessionsDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const file of files) {
+    if (!file.isFile() || !file.name.endsWith(".json")) continue;
+    const candidate = readOwnedRecordCandidate(join(sessionsDir, file.name));
+    if (!candidate || (await probeSocket(candidate.socketPath, connectSocket)) !== "unreachable") {
+      continue;
+    }
+
+    const current = readOwnedRecordCandidate(candidate.path);
+    if (
+      !current ||
+      current.contents !== candidate.contents ||
+      !isSameRecord(current.identity, candidate.identity)
+    ) {
+      continue;
+    }
+
+    try {
+      const finalStat = lstatSync(candidate.path);
+      if (!finalStat.isFile() || !isSameRecord(recordIdentity(finalStat), current.identity))
+        continue;
+      unlinkSync(candidate.path);
+    } catch {
+      // The candidate changed again or was already removed.
+    }
+  }
+}
+
+async function isLive(socketPath: string, connectSocket: SocketConnector): Promise<boolean> {
+  return (await probeSocket(socketPath, connectSocket)) === "reachable";
 }
 
 function ref(record: SessionRecord): string {
@@ -153,14 +298,20 @@ function sendFrame(socketPath: string, frame: PeerFrame): Promise<void> {
  * Registers the opt-in Claude Code peer integration.
  *
  * @param pi - Pi extension API used to register flags, lifecycle handlers, and peer tools.
+ * @param options - Optional system-boundary controls for Unix-socket probes.
+ * @returns Nothing.
  */
-export default function piBridge(pi: ExtensionAPI): void {
+export default function piBridge(
+  pi: ExtensionAPI,
+  options: BridgeOptions = { connectSocket: undefined },
+): void {
   pi.registerFlag("bridge", {
     description: "Make this pi session addressable from Claude Code peer messaging",
     type: "boolean",
     default: false,
   });
 
+  const connectSocket = options.connectSocket ?? ((connectOptions) => connect(connectOptions));
   const pid = process.pid;
   let socketPath = "";
   let recordPath = "";
@@ -329,6 +480,7 @@ export default function piBridge(pi: ExtensionAPI): void {
       try {
         const sessionsDir = resolveSessionsDir();
         prepareDirectory(sessionsDir, createdDirectories);
+        await reapStaleRecords(sessionsDir, connectSocket);
         const socketDir = resolveSocketDir();
         prepareDirectory(socketDir, createdDirectories);
 
@@ -489,7 +641,7 @@ export default function piBridge(pi: ExtensionAPI): void {
         const records = readRecords().filter((record) => record.pid !== pid);
         const live = await Promise.all(
           records.map(async (record) =>
-            (await isLive(record.messagingSocketPath)) ? record : undefined,
+            (await isLive(record.messagingSocketPath, connectSocket)) ? record : undefined,
           ),
         );
         const peers = live.filter((record): record is SessionRecord => record !== undefined);
