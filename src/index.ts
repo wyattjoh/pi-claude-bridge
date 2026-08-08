@@ -1,5 +1,5 @@
 /**
- * cc-peer: makes a pi session addressable from Claude Code's cross-session
+ * pi-bridge: makes a pi session addressable from Claude Code's cross-session
  * messaging tools (ListAgents / SendMessage).
  *
  * Claude Code discovers peers by reading ~/.claude/sessions/<pid>.json and
@@ -136,7 +136,7 @@ function sendFrame(socketPath: string, frame: PeerFrame): Promise<void> {
  *
  * @param pi - Pi extension API used to register flags, lifecycle handlers, and peer tools.
  */
-export default function ccPeer(pi: ExtensionAPI): void {
+export default function piBridge(pi: ExtensionAPI): void {
   pi.registerFlag("claude-peer", {
     description: "Make this pi session addressable from Claude Code peer messaging",
     type: "boolean",
@@ -202,13 +202,13 @@ export default function ccPeer(pi: ExtensionAPI): void {
     try {
       frame = JSON.parse(line);
     } catch {
-      ctx.ui.notify(`cc-peer: unparseable frame: ${line.slice(0, 120)}`, "warning");
+      ctx.ui.notify(`pi-bridge: unparseable frame: ${line.slice(0, 120)}`, "warning");
       return;
     }
 
     if (frame.action === "peer_message_status") {
       ctx.ui.notify(
-        `cc-peer: delivery ${String(frame.status)} for ${String(frame.orig_msg_id ?? "")}`,
+        `pi-bridge: delivery ${String(frame.status)} for ${String(frame.orig_msg_id ?? "")}`,
         "info",
       );
       return;
@@ -264,13 +264,13 @@ export default function ccPeer(pi: ExtensionAPI): void {
       conn.on("error", () => connections.delete(conn));
     });
     server.on("error", (error) =>
-      ctx.ui.notify(`cc-peer: server error: ${error.message}`, "error"),
+      ctx.ui.notify(`pi-bridge: server error: ${error.message}`, "error"),
     );
     server.listen(socketPath, () => {
       chmodSync(socketPath, 0o600);
       server?.unref();
       writeRecord("idle");
-      ctx.ui.setStatus("cc-peer", `peer: ${name}`);
+      ctx.ui.setStatus("pi-bridge", `peer: ${name}`);
     });
   };
 
@@ -297,7 +297,7 @@ export default function ccPeer(pi: ExtensionAPI): void {
       name: "list_agents",
       label: "List agents",
       description:
-        "List live peer sessions on this machine (Claude Code sessions and other cc-peer pi sessions). " +
+        "List live peer sessions on this machine (Claude Code sessions and other pi-bridge sessions). " +
         "Returns each peer's name, ref, status, and working directory. Use the name as the 'to' argument of send_message.",
       parameters: Type.Object({}),
       async execute() {

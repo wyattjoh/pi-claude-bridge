@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import ccPeer from "./index.ts";
+import piBridge from "./index.ts";
 
 type Handler = (event: unknown, ctx: unknown) => Promise<unknown> | unknown;
 
@@ -31,10 +31,10 @@ function createHarness() {
   return { flags, handlers, pi, tools };
 }
 
-describe("cc-peer opt-in", () => {
+describe("pi-bridge opt-in", () => {
   test("stays inactive unless --claude-peer is provided", async () => {
     const harness = createHarness();
-    ccPeer(harness.pi as never);
+    piBridge(harness.pi as never);
 
     expect(harness.flags.get("claude-peer")).toEqual({
       default: false,

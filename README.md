@@ -1,4 +1,4 @@
-# @wyattjoh/pi-cc-socket
+# @wyattjoh/pi-bridge
 
 A [Pi](https://pi.dev/) extension that makes a Pi session addressable from
 Claude Code's cross-session peer messaging tools.
@@ -10,7 +10,7 @@ started with `--claude-peer`.
 ## Install
 
 ```sh
-pi install npm:@wyattjoh/pi-cc-socket
+pi install npm:@wyattjoh/pi-bridge
 ```
 
 ## Usage

@@ -1,5 +1,5 @@
 {
-  "name": "@wyattjoh/pi-cc-socket",
+  "name": "@wyattjoh/pi-bridge",
   "version": "0.1.0",
   "description": "Opt-in Pi extension for Claude Code peer messaging over a Unix socket",
   "keywords": [
@@ -8,15 +8,15 @@
     "pi-extension",
     "pi-package"
   ],
-  "homepage": "https://github.com/wyattjoh/pi-cc-socket#readme",
+  "homepage": "https://github.com/wyattjoh/pi-bridge#readme",
   "bugs": {
-    "url": "https://github.com/wyattjoh/pi-cc-socket/issues"
+    "url": "https://github.com/wyattjoh/pi-bridge/issues"
   },
   "license": "MIT",
   "author": "Wyatt Johnson",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wyattjoh/pi-cc-socket.git"
+    "url": "git+https://github.com/wyattjoh/pi-bridge.git"
   },
   "files": [
     "src",

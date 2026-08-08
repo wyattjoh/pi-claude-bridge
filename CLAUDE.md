@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This repository owns `@wyattjoh/pi-cc-socket`, a Pi extension that exposes an
+This repository owns `@wyattjoh/pi-bridge`, a Pi extension that exposes an
 opt-in Pi session to Claude Code peer messaging.
 
 ## Development
