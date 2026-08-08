@@ -32,15 +32,20 @@ function createHarness() {
 }
 
 describe("pi-bridge opt-in", () => {
-  test("stays inactive unless --claude-peer is provided", async () => {
+  test("stays inactive unless --bridge is provided", async () => {
     const harness = createHarness();
     piBridge(harness.pi as never);
 
-    expect(harness.flags.get("claude-peer")).toEqual({
-      default: false,
-      description: "Make this pi session addressable from Claude Code peer messaging",
-      type: "boolean",
-    });
+    expect([...harness.flags]).toEqual([
+      [
+        "bridge",
+        {
+          default: false,
+          description: "Make this pi session addressable from Claude Code peer messaging",
+          type: "boolean",
+        },
+      ],
+    ]);
     expect(harness.tools).toEqual([]);
 
     await harness.handlers.get("session_start")?.({}, {});

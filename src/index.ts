@@ -137,14 +137,10 @@ function sendFrame(socketPath: string, frame: PeerFrame): Promise<void> {
  * @param pi - Pi extension API used to register flags, lifecycle handlers, and peer tools.
  */
 export default function piBridge(pi: ExtensionAPI): void {
-  pi.registerFlag("claude-peer", {
+  pi.registerFlag("bridge", {
     description: "Make this pi session addressable from Claude Code peer messaging",
     type: "boolean",
     default: false,
-  });
-  pi.registerFlag("cc-name", {
-    description: "Peer name this pi session advertises when --claude-peer is enabled",
-    type: "string",
   });
 
   const pid = process.pid;
@@ -155,7 +151,7 @@ export default function piBridge(pi: ExtensionAPI): void {
   let startedAt = 0;
   let server: Server | undefined;
   const connections = new Set<Socket>();
-  let name = `pi-${basename(process.cwd()).replace(/[^A-Za-z0-9_-]/g, "-")}-${pid}`.slice(0, 80);
+  const name = `pi-${basename(process.cwd()).replace(/[^A-Za-z0-9_-]/g, "-")}-${pid}`.slice(0, 80);
   let streaming = false;
   let toolsRegistered = false;
 
@@ -233,10 +229,6 @@ export default function piBridge(pi: ExtensionAPI): void {
     sessionId = randomUUID();
     startedAt = Date.now();
 
-    const flagName = pi.getFlag("cc-name");
-    if (typeof flagName === "string" && flagName.length > 0) {
-      name = flagName.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 80);
-    }
     mkdirSync(socketDir, { recursive: true, mode: 0o700 });
     try {
       rmSync(socketPath);
@@ -374,7 +366,7 @@ export default function piBridge(pi: ExtensionAPI): void {
   };
 
   pi.on("session_start", async (_event, ctx) => {
-    if (!pi.getFlag("claude-peer")) return;
+    if (!pi.getFlag("bridge")) return;
     registerTools();
     startServer(ctx);
   });
