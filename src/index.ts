@@ -1,317 +1,31 @@
 /**
- * pi-bridge: makes a pi session addressable from Claude Code's cross-session
- * messaging tools (ListAgents / SendMessage).
- *
- * Claude Code discovers peers by reading ~/.claude/sessions/<pid>.json and
- * liveness-probing each record's messagingSocketPath. This extension writes
- * such a record for the pi process and serves the same newline-delimited JSON
- * protocol on a unix socket, so pi shows up as just another peer session.
- *
- * The reverse-engineered protocol is documented in the cc-pi repository.
+ * pi-bridge makes an opt-in Pi session addressable from Claude Code's
+ * cross-session messaging tools. The bridge creates a Claude-compatible record
+ * and newline-delimited JSON Unix socket only after `--bridge` is enabled.
  */
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Effect, ManagedRuntime } from "effect";
 import { Type } from "typebox";
-import {
-  chmodSync,
-  linkSync,
-  lstatSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  unlinkSync,
-  rmdirSync,
-  type Stats,
-  writeFileSync,
-} from "node:fs";
-import { connect, createServer, type Server, type Socket } from "node:net";
-import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { Bridge, type BridgeOperations, createBridgeLayer, formatPeerReference } from "./bridge.ts";
+import { nodePlatform, type NodePlatform } from "./platform.ts";
 
-const PROBE_TIMEOUT_MS = 250;
-const MAX_PEER_FRAME_BYTES = 1_048_576;
-
-function resolveSessionsDir(): string {
-  const configDirectory = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
-  return join(configDirectory, "sessions");
-}
-
-type SessionRecord = {
-  pid: number;
-  sessionId: string;
-  cwd: string;
-  name: string;
-  status: string;
-  messagingSocketPath: string;
-  peerProtocol: number | undefined;
-  startedAt: number | undefined;
-};
-
-type PeerFrame = {
-  msgV: number;
-  msg_id: string;
-  type: "user";
-  message: { role: "user"; content: string };
-  priority: "next";
-  from: string;
-};
-
-/** Claude derives this from XDG_RUNTIME_DIR or its tmpdir. Follow whatever live sessions already use so we land in the same namespace. */
-function resolveSocketDir(): string {
-  for (const record of readRecords()) {
-    if (record.messagingSocketPath) return dirname(record.messagingSocketPath);
-  }
-  return join(process.env.XDG_RUNTIME_DIR ?? tmpdir(), "cc-socks");
-}
-
-function readRecords(): SessionRecord[] {
-  let files: string[];
-  try {
-    files = readdirSync(resolveSessionsDir());
-  } catch {
-    return [];
-  }
-  const records: SessionRecord[] = [];
-  for (const file of files) {
-    if (!file.endsWith(".json")) continue;
-    try {
-      const record = JSON.parse(
-        readFileSync(join(resolveSessionsDir(), file), "utf8"),
-      ) as SessionRecord;
-      if (typeof record.messagingSocketPath === "string") records.push(record);
-    } catch {
-      // A session record mid-write is not worth failing discovery over.
-    }
-  }
-  return records;
-}
-
-type SocketProbeOutcome = "reachable" | "unreachable" | "indeterminate";
-
-type SocketConnector = (options: { path: string }) => Socket;
+type SocketConnector = (options: { readonly path: string }) => import("node:net").Socket;
 
 type BridgeOptions = {
-  connectSocket: SocketConnector | undefined;
+  readonly connectSocket: SocketConnector | undefined;
+  readonly platform: Partial<NodePlatform> | undefined;
 };
-
-type PathIdentity = {
-  device: number;
-  inode: number;
-};
-
-type RecordIdentity = PathIdentity & {
-  size: number;
-  modifiedAt: number;
-  changedAt: number;
-};
-
-type PreservedSocketReplacement = {
-  path: string;
-  identity: PathIdentity;
-};
-
-type OwnedRecordCandidate = {
-  path: string;
-  contents: string;
-  socketPath: string;
-  identity: RecordIdentity;
-};
-
-function recordIdentity(stat: Stats): RecordIdentity {
-  return {
-    device: stat.dev,
-    inode: stat.ino,
-    size: stat.size,
-    modifiedAt: stat.mtimeMs,
-    changedAt: stat.ctimeMs,
-  };
-}
-
-function isSameRecord(left: RecordIdentity, right: RecordIdentity): boolean {
-  return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.size === right.size &&
-    left.modifiedAt === right.modifiedAt &&
-    left.changedAt === right.changedAt
-  );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function hasOwnershipMarker(record: Record<string, unknown>): boolean {
-  const marker = record._piBridge;
-  return isRecord(marker) && Object.keys(marker).length === 1 && marker.recordVersion === 1;
-}
-
-function readOwnedRecordCandidate(path: string): OwnedRecordCandidate | undefined {
-  try {
-    const before = lstatSync(path);
-    if (!before.isFile()) return undefined;
-    const beforeIdentity = recordIdentity(before);
-
-    const contents = readFileSync(path, "utf8");
-    const after = lstatSync(path);
-    if (!after.isFile()) return undefined;
-    const afterIdentity = recordIdentity(after);
-    if (!isSameRecord(beforeIdentity, afterIdentity)) return undefined;
-
-    const record: unknown = JSON.parse(contents);
-    if (!isRecord(record) || !hasOwnershipMarker(record)) return undefined;
-
-    const socketPath = record.messagingSocketPath;
-    if (typeof socketPath !== "string" || !isAbsolute(socketPath) || socketPath.includes("\0")) {
-      return undefined;
-    }
-
-    return {
-      path,
-      contents,
-      socketPath,
-      identity: afterIdentity,
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-function probeSocket(
-  socketPath: string,
-  connectSocket: SocketConnector,
-): Promise<SocketProbeOutcome> {
-  return new Promise((resolve) => {
-    let probe: Socket;
-    let settled = false;
-    const settle = (outcome: SocketProbeOutcome) => {
-      if (settled) return;
-      settled = true;
-      probe.destroy();
-      resolve(outcome);
-    };
-
-    try {
-      probe = connectSocket({ path: socketPath });
-    } catch {
-      resolve("indeterminate");
-      return;
-    }
-
-    probe.once("connect", () => settle("reachable"));
-    probe.once("error", (error: NodeJS.ErrnoException) =>
-      settle(
-        error.code === "ENOENT" || error.code === "ECONNREFUSED" ? "unreachable" : "indeterminate",
-      ),
-    );
-    probe.setTimeout(PROBE_TIMEOUT_MS, () => settle("indeterminate"));
-  });
-}
-
-async function reapStaleRecords(
-  sessionsDir: string,
-  connectSocket: SocketConnector,
-): Promise<void> {
-  let files;
-  try {
-    files = readdirSync(sessionsDir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-
-  for (const file of files) {
-    if (!file.isFile() || !file.name.endsWith(".json")) continue;
-    const candidate = readOwnedRecordCandidate(join(sessionsDir, file.name));
-    if (!candidate || (await probeSocket(candidate.socketPath, connectSocket)) !== "unreachable") {
-      continue;
-    }
-
-    const current = readOwnedRecordCandidate(candidate.path);
-    if (
-      !current ||
-      current.contents !== candidate.contents ||
-      !isSameRecord(current.identity, candidate.identity)
-    ) {
-      continue;
-    }
-
-    try {
-      const finalStat = lstatSync(candidate.path);
-      if (!finalStat.isFile() || !isSameRecord(recordIdentity(finalStat), current.identity))
-        continue;
-      unlinkSync(candidate.path);
-    } catch {
-      // The candidate changed again or was already removed.
-    }
-  }
-}
-
-async function isLive(socketPath: string, connectSocket: SocketConnector): Promise<boolean> {
-  return (await probeSocket(socketPath, connectSocket)) === "reachable";
-}
-
-function ref(record: SessionRecord): string {
-  return (record.sessionId ?? "").replace(/-/g, "").slice(0, 6);
-}
-
-/** Accepts a bare name, a "name [ref]" from a listing, or a raw uds:/path address. */
-function resolveTarget(
-  to: string,
-  selfPid: number,
-): { path: string; label: string } | { error: string } {
-  const trimmed = to.trim();
-  if (trimmed.startsWith("uds:")) return { path: trimmed.slice(4), label: trimmed };
-  if (trimmed.startsWith("/")) return { path: trimmed, label: `uds:${trimmed}` };
-
-  const match = /^(.*?)\s*\[([0-9a-f]+)\]$/.exec(trimmed);
-  const wantedName = (match?.[1] ?? trimmed).trim();
-  const wantedRef = match?.[2];
-
-  const candidates = readRecords().filter(
-    (record) =>
-      record.pid !== selfPid &&
-      record.name === wantedName &&
-      (!wantedRef || ref(record).startsWith(wantedRef)),
-  );
-  const candidate = candidates[0];
-  if (!candidate)
-    return {
-      error: `No peer named '${wantedName}'. Run list_agents to see current peers.`,
-    };
-  if (candidates.length > 1) {
-    const refs = candidates.map((record) => `${record.name} [${ref(record)}]`).join(", ");
-    return {
-      error: `'${wantedName}' is ambiguous. Re-send with a ref: ${refs}`,
-    };
-  }
-  return { path: candidate.messagingSocketPath, label: candidate.name };
-}
-
-function sendFrame(socketPath: string, frame: PeerFrame): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const conn = connect({ path: socketPath }, () => {
-      conn.end(`${JSON.stringify(frame)}\n`, () => resolve());
-    });
-    conn.setTimeout(5000, () => {
-      conn.destroy();
-      reject(new Error(`Timed out writing to ${socketPath}`));
-    });
-    conn.on("error", reject);
-  });
-}
 
 /**
  * Registers the opt-in Claude Code peer integration.
  *
  * @param pi - Pi extension API used to register flags, lifecycle handlers, and peer tools.
- * @param options - Optional system-boundary controls for Unix-socket probes.
+ * @param options - Optional Node-boundary controls for lifecycle and transport tests.
  * @returns Nothing.
  */
 export default function piBridge(
   pi: ExtensionAPI,
-  options: BridgeOptions = { connectSocket: undefined },
+  options: BridgeOptions = { connectSocket: undefined, platform: undefined },
 ): void {
   pi.registerFlag("bridge", {
     description: "Make this pi session addressable from Claude Code peer messaging",
@@ -319,382 +33,17 @@ export default function piBridge(
     default: false,
   });
 
-  const connectSocket = options.connectSocket ?? ((connectOptions) => connect(connectOptions));
-  const pid = process.pid;
-  let socketPath = "";
-  let recordPath = "";
-  let selfAddress = "";
-  let sessionId = "";
-  let startedAt = 0;
-  const name = `pi-${basename(process.cwd()).replace(/[^A-Za-z0-9_-]/g, "-")}-${pid}`.slice(0, 80);
   let streaming = false;
+  let starting = false;
   let toolsRegistered = false;
+  let bridge: BridgeOperations | undefined;
+  let runtime: ManagedRuntime.ManagedRuntime<Bridge, unknown> | undefined;
+  let runInbound = (_line: string) => undefined;
 
-  const runtime = (() => {
-    let server: Server | undefined;
-    const connections = new Set<Socket>();
-    let running = false;
-    let recordPublished = false;
-    let ownedRecordIdentity: RecordIdentity | undefined;
-    let socketIdentity: PathIdentity | undefined;
-    let degradationWarned = false;
-
-    const createRecord = (status: "busy" | "idle") => {
-      const now = Date.now();
-      return {
-        pid,
-        sessionId,
-        cwd: process.cwd(),
-        startedAt,
-        procStart: new Date(startedAt).toString(),
-        version: `pi-${process.env.PI_VERSION ?? "0.84.0"}`,
-        peerProtocol: 1,
-        kind: "interactive",
-        entrypoint: "cli",
-        messagingSocketPath: socketPath,
-        name,
-        nameSource: "derived",
-        status,
-        updatedAt: now,
-        statusUpdatedAt: now,
-        _piBridge: { recordVersion: 1 },
-      };
-    };
-
-    const prepareDirectory = (path: string, createdDirectories: string[]) => {
-      const missingDirectories: string[] = [];
-      let cursor = path;
-      while (true) {
-        try {
-          const stat = lstatSync(cursor);
-          if (!stat.isDirectory()) throw new Error(`${cursor} is not a directory`);
-          break;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          missingDirectories.push(cursor);
-          const parent = dirname(cursor);
-          if (parent === cursor) throw error;
-          cursor = parent;
-        }
-      }
-
-      for (const missingDirectory of [...missingDirectories].reverse()) {
-        try {
-          mkdirSync(missingDirectory, { mode: 0o700 });
-          createdDirectories.unshift(missingDirectory);
-          chmodSync(missingDirectory, 0o700);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-          if (!lstatSync(missingDirectory).isDirectory()) {
-            throw new Error(`${missingDirectory} is not a directory`);
-          }
-        }
-      }
-    };
-
-    const temporaryRecordPath = () =>
-      join(dirname(recordPath), `.${basename(recordPath)}.${randomUUID()}.tmp`);
-
-    const withTemporaryRecord = (
-      status: "busy" | "idle",
-      publish: (temporaryPath: string) => void,
-    ) => {
-      const temporaryPath = temporaryRecordPath();
-      try {
-        writeFileSync(temporaryPath, JSON.stringify(createRecord(status)), {
-          encoding: "utf8",
-          flag: "wx",
-          mode: 0o600,
-        });
-        chmodSync(temporaryPath, 0o600);
-        publish(temporaryPath);
-      } finally {
-        rmSync(temporaryPath, { force: true });
-      }
-    };
-
-    const capturePublishedRecordIdentity = (temporaryStat: Stats) => {
-      const publishedStat = lstatSync(recordPath);
-      ownedRecordIdentity =
-        publishedStat.isFile() &&
-        publishedStat.dev === temporaryStat.dev &&
-        publishedStat.ino === temporaryStat.ino
-          ? recordIdentity(publishedStat)
-          : undefined;
-    };
-
-    const publishInitialRecord = () => {
-      withTemporaryRecord("idle", (temporaryPath) => {
-        const temporaryStat = lstatSync(temporaryPath);
-        linkSync(temporaryPath, recordPath);
-        recordPublished = true;
-        unlinkSync(temporaryPath);
-        capturePublishedRecordIdentity(temporaryStat);
-      });
-    };
-
-    const rewriteRecord = (status: "busy" | "idle") => {
-      withTemporaryRecord(status, (temporaryPath) => {
-        const temporaryStat = lstatSync(temporaryPath);
-        renameSync(temporaryPath, recordPath);
-        capturePublishedRecordIdentity(temporaryStat);
-      });
-    };
-
-    const closeServer = async () => {
-      const currentServer = server;
-      if (!currentServer?.listening) return;
-      await new Promise<void>((resolve) => currentServer.close(() => resolve()));
-    };
-
-    const removeOwnedRecord = () => {
-      if (!recordPublished || !ownedRecordIdentity) return;
-      try {
-        const before = lstatSync(recordPath);
-        if (!before.isFile() || !isSameRecord(recordIdentity(before), ownedRecordIdentity)) return;
-        const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
-          sessionId: unknown;
-          _piBridge: { recordVersion: unknown } | undefined;
-        };
-        const after = lstatSync(recordPath);
-        if (!after.isFile() || !isSameRecord(recordIdentity(after), ownedRecordIdentity)) return;
-        if (record.sessionId !== sessionId || record._piBridge?.recordVersion !== 1) return;
-        unlinkSync(recordPath);
-      } catch {
-        // Leave anything whose ownership cannot be proven.
-      }
-    };
-
-    const prepareSocketShutdown = (): PreservedSocketReplacement | undefined => {
-      if (!socketIdentity) return undefined;
-      try {
-        const stat = lstatSync(socketPath);
-        if (
-          stat.isSocket() &&
-          stat.dev === socketIdentity.device &&
-          stat.ino === socketIdentity.inode
-        ) {
-          unlinkSync(socketPath);
-          return undefined;
-        }
-        if (stat.isDirectory()) return undefined;
-
-        const preservedPath = join(
-          dirname(socketPath),
-          `.${basename(socketPath)}.${randomUUID()}.replacement`,
-        );
-        linkSync(socketPath, preservedPath);
-        return {
-          path: preservedPath,
-          identity: { device: stat.dev, inode: stat.ino },
-        };
-      } catch {
-        return undefined;
-      }
-    };
-
-    const restoreSocketReplacement = (
-      preservedReplacement: PreservedSocketReplacement | undefined,
-    ) => {
-      if (!preservedReplacement) return;
-      try {
-        linkSync(preservedReplacement.path, socketPath);
-        unlinkSync(preservedReplacement.path);
-      } catch {
-        try {
-          const current = lstatSync(socketPath);
-          if (
-            current.dev === preservedReplacement.identity.device &&
-            current.ino === preservedReplacement.identity.inode
-          ) {
-            unlinkSync(preservedReplacement.path);
-          }
-        } catch {
-          // Keep the replacement's hard link rather than deleting it.
-        }
-      }
-    };
-
-    const reset = () => {
-      server = undefined;
-      running = false;
-      recordPublished = false;
-      ownedRecordIdentity = undefined;
-      socketIdentity = undefined;
-      degradationWarned = false;
-    };
-
-    const stop = async () => {
-      for (const connection of connections) connection.destroy();
-      connections.clear();
-      const preservedSocketReplacement = prepareSocketShutdown();
-      await closeServer();
-      restoreSocketReplacement(preservedSocketReplacement);
-      removeOwnedRecord();
-      reset();
-    };
-
-    const rollback = async (createdDirectories: string[]) => {
-      await stop();
-      for (const path of createdDirectories) {
-        try {
-          rmdirSync(path);
-        } catch {
-          // Keep pre-existing or now non-empty directories.
-        }
-      }
-    };
-
-    const start = async (ctx: ExtensionContext) => {
-      if (running) return;
-      const createdDirectories: string[] = [];
-      try {
-        const sessionsDir = resolveSessionsDir();
-        prepareDirectory(sessionsDir, createdDirectories);
-        await reapStaleRecords(sessionsDir, connectSocket);
-        const socketDir = resolveSocketDir();
-        prepareDirectory(socketDir, createdDirectories);
-
-        socketPath = join(socketDir, `${pid}.sock`);
-        recordPath = join(sessionsDir, `${pid}.json`);
-        selfAddress = `uds:${socketPath}`;
-        sessionId = randomUUID();
-        startedAt = Date.now();
-
-        const nextServer = createServer({ allowHalfOpen: true }, (connection) => {
-          connections.add(connection);
-          let pendingFrame = Buffer.alloc(0);
-          let rejected = false;
-
-          const rejectOversizedFrame = () => {
-            if (rejected) return;
-            rejected = true;
-            pendingFrame = Buffer.alloc(0);
-            ctx.ui.notify(
-              `pi-bridge: peer frame exceeds ${MAX_PEER_FRAME_BYTES} byte limit`,
-              "warning",
-            );
-            connection.destroy();
-          };
-
-          const appendToPendingFrame = (bytes: Buffer): boolean => {
-            const nextLength = pendingFrame.length + bytes.length;
-            if (nextLength > MAX_PEER_FRAME_BYTES) {
-              rejectOversizedFrame();
-              return false;
-            }
-            if (bytes.length === 0) return true;
-            pendingFrame =
-              pendingFrame.length === 0
-                ? Buffer.from(bytes)
-                : Buffer.concat([pendingFrame, bytes], nextLength);
-            return true;
-          };
-
-          const processPendingFrame = () => {
-            const line = pendingFrame.toString("utf8");
-            pendingFrame = Buffer.alloc(0);
-            if (line.trim()) handleLine(line, ctx);
-          };
-
-          connection.on("data", (chunk) => {
-            let offset = 0;
-            while (offset < chunk.length && !rejected) {
-              const newlineIndex = chunk.indexOf(0x0a, offset);
-              if (newlineIndex === -1) {
-                appendToPendingFrame(chunk.subarray(offset));
-                return;
-              }
-
-              if (!appendToPendingFrame(chunk.subarray(offset, newlineIndex))) return;
-              processPendingFrame();
-              offset = newlineIndex + 1;
-            }
-          });
-          connection.on("end", () => {
-            if (rejected) return;
-            if (pendingFrame.length > 0) processPendingFrame();
-            connection.end();
-          });
-          connection.on("close", () => connections.delete(connection));
-          connection.on("error", () => connections.delete(connection));
-        });
-        server = nextServer;
-
-        await new Promise<void>((resolve, reject) => {
-          const handleStartupError = (error: Error) => reject(error);
-          nextServer.once("error", handleStartupError);
-          nextServer.listen(socketPath, () => {
-            nextServer.off("error", handleStartupError);
-            resolve();
-          });
-        });
-
-        const socketStat = lstatSync(socketPath);
-        socketIdentity = { device: socketStat.dev, inode: socketStat.ino };
-        chmodSync(socketPath, 0o600);
-        nextServer.unref();
-        nextServer.on("error", (error) =>
-          ctx.ui.notify(`pi-bridge: server error: ${error.message}`, "error"),
-        );
-        publishInitialRecord();
-        running = true;
-      } catch (error) {
-        await rollback(createdDirectories);
-        throw error;
-      }
-    };
-
-    const updateStatus = (status: "busy" | "idle", ctx: ExtensionContext) => {
-      if (!running) return;
-      try {
-        rewriteRecord(status);
-      } catch (error) {
-        if (degradationWarned) return;
-        degradationWarned = true;
-        const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`pi-bridge: session status updates degraded: ${message}`, "warning");
-      }
-    };
-
-    return { start, updateStatus, stop };
-  })();
-
-  const deliver = (content: string, ctx: ExtensionContext) => {
-    // sendUserMessage throws when the agent is mid-stream unless told how to queue.
-    if (streaming) {
-      pi.sendUserMessage(content, { deliverAs: "followUp" });
-      return;
-    }
-    pi.sendUserMessage(content);
-    ctx.ui.notify("Peer message received", "info");
-  };
-
-  const handleLine = (line: string, ctx: ExtensionContext) => {
-    let frame: Record<string, unknown>;
-    try {
-      frame = JSON.parse(line);
-    } catch {
-      ctx.ui.notify(`pi-bridge: unparseable frame: ${line.slice(0, 120)}`, "warning");
-      return;
-    }
-
-    if (frame.action === "peer_message_status") {
-      ctx.ui.notify(
-        `pi-bridge: delivery ${String(frame.status)} for ${String(frame.orig_msg_id ?? "")}`,
-        "info",
-      );
-      return;
-    }
-    if (frame.type !== "user") return;
-
-    const message = frame.message as { content?: unknown } | undefined;
-    const content = typeof message?.content === "string" ? message.content : undefined;
-    if (!content) return;
-
-    // Claude wraps the body in <cross-session-message from="uds:..."> already, which
-    // carries the reply address the send_message tool needs. Pass it through intact.
-    deliver(content, ctx);
+  const platform: NodePlatform = {
+    ...nodePlatform,
+    ...options.platform,
+    connect: options.connectSocket ?? options.platform?.connect ?? nodePlatform.connect,
   };
 
   const registerTools = () => {
@@ -709,29 +58,18 @@ export default function piBridge(
         "Returns each peer's name, ref, status, and working directory. Use the name as the 'to' argument of send_message.",
       parameters: Type.Object({}),
       async execute() {
-        const records = readRecords().filter((record) => record.pid !== pid);
-        const live = await Promise.all(
-          records.map(async (record) =>
-            (await isLive(record.messagingSocketPath, connectSocket)) ? record : undefined,
-          ),
-        );
-        const peers = live.filter((record): record is SessionRecord => record !== undefined);
+        if (!runtime || !bridge) throw new Error("pi-bridge is not ready");
+        const peers = await runtime.runPromise(bridge.listPeers());
         if (peers.length === 0) {
-          return {
-            content: [{ type: "text", text: "No live peer sessions." }],
-            details: {},
-          };
+          return { content: [{ type: "text", text: "No live peer sessions." }], details: {} };
         }
         const lines = peers.map(
-          (record) =>
-            `${record.name} [${ref(record)}]  ·  ${record.status ?? "unknown"}  ·  ${record.cwd}`,
+          (peer) =>
+            `${peer.name} [${formatPeerReference(peer.sessionId)}]  ·  ${peer.status ?? "unknown"}  ·  ${peer.cwd}`,
         );
         return {
           content: [
-            {
-              type: "text",
-              text: `Peer sessions (${peers.length}):\n${lines.join("\n")}`,
-            },
+            { type: "text", text: `Peer sessions (${peers.length}):\n${lines.join("\n")}` },
           ],
           details: {},
         };
@@ -746,59 +84,91 @@ export default function piBridge(
         "or a raw uds: address. To reply to an incoming <cross-session-message>, pass its from= attribute as 'to'. " +
         "Your plain output is NOT visible to peers; this tool is the only way to reach them.",
       parameters: Type.Object({
-        to: Type.String({
-          description: "Peer name, 'name [ref]', or uds: address",
-        }),
+        to: Type.String({ description: "Peer name, 'name [ref]', or uds: address" }),
         message: Type.String({ description: "Message body" }),
       }),
       async execute(_toolCallId, params) {
-        const target = resolveTarget(params.to, pid);
-        if ("error" in target) throw new Error(target.error);
-        const frame: PeerFrame = {
-          msgV: 1,
-          msg_id: randomUUID(),
-          type: "user",
-          message: {
-            role: "user",
-            content:
-              `<cross-session-message from="${selfAddress}" from-name="${name}" from-mode="prompting">\n` +
-              `${params.message}\n</cross-session-message>`,
-          },
-          priority: "next",
-          from: selfAddress,
-        };
-        await sendFrame(target.path, frame);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Delivered to ${target.label} (msg_id ${frame.msg_id})`,
-            },
-          ],
-          details: {},
-        };
+        if (!runtime || !bridge || !params) throw new Error("pi-bridge is not ready");
+        try {
+          const delivery = await runtime.runPromise(bridge.sendMessage(params.to, params.message));
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Delivered to ${delivery.label} (msg_id ${delivery.messageId})`,
+              },
+            ],
+            details: {},
+          };
+        } catch (error) {
+          throw new Error(error instanceof Error ? error.message : String(error));
+        }
       },
     });
   };
 
   pi.on("session_start", async (_event, ctx) => {
-    if (!pi.getFlag("bridge")) return;
+    if (!pi.getFlag("bridge") || runtime || starting) return;
+    starting = true;
+
+    const host = {
+      deliver(content: string) {
+        if (streaming) {
+          pi.sendUserMessage(content, { deliverAs: "followUp" });
+          return;
+        }
+        pi.sendUserMessage(content);
+        ctx.ui.notify("Peer message received", "info");
+      },
+      notify(message: string, level: "error" | "info" | "warning") {
+        ctx.ui.notify(message, level);
+      },
+    };
+    const nextRuntime = ManagedRuntime.make(
+      createBridgeLayer({ host, onFrame: (line) => runInbound(line), platform }),
+    );
     try {
-      await runtime.start(ctx);
+      const nextBridge = await nextRuntime.runPromise(
+        Effect.gen(function* () {
+          return yield* Bridge;
+        }),
+      );
+      bridge = nextBridge;
+      runtime = nextRuntime;
+      runInbound = (line) => {
+        runtime?.runCallback(nextBridge.receiveLine(line), {
+          onExit: (exit) => {
+            if (exit._tag === "Failure") {
+              ctx.ui.notify("pi-bridge: failed to process peer frame", "warning");
+            }
+          },
+        });
+      };
       registerTools();
-      ctx.ui.setStatus("pi-bridge", `peer: ${name}`);
+      ctx.ui.setStatus("pi-bridge", `peer: ${nextBridge.name}`);
     } catch (error) {
+      await nextRuntime.dispose();
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui.notify(`pi-bridge: startup failed, bridge disabled: ${message}`, "error");
+    } finally {
+      starting = false;
     }
   });
-  pi.on("session_shutdown", async () => runtime.stop());
-  pi.on("agent_start", async (_event, ctx) => {
-    streaming = true;
-    runtime.updateStatus("busy", ctx);
+
+  pi.on("session_shutdown", async () => {
+    const currentRuntime = runtime;
+    bridge = undefined;
+    runtime = undefined;
+    starting = false;
+    runInbound = (_line: string) => undefined;
+    await currentRuntime?.dispose();
   });
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_start", async () => {
+    streaming = true;
+    if (runtime && bridge) await runtime.runPromise(bridge.updateStatus("busy"));
+  });
+  pi.on("agent_settled", async () => {
     streaming = false;
-    runtime.updateStatus("idle", ctx);
+    if (runtime && bridge) await runtime.runPromise(bridge.updateStatus("idle"));
   });
 }

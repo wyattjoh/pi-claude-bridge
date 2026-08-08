@@ -14,6 +14,7 @@ import { connect, createServer, type Server, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import piBridge from "./index.ts";
+import { nodePlatform } from "./platform.ts";
 
 const MAX_PEER_FRAME_BYTES = 1_048_576;
 
@@ -365,6 +366,23 @@ describe("pi-bridge opt-in", () => {
     });
   });
 
+  test.serial("does not acquire a second bridge for duplicate start events", async () => {
+    await withTestPaths(async ({ sessionsDir }) => {
+      const harness = createHarness(true);
+      piBridge(harness.pi as never);
+
+      await harness.fire("session_start");
+      await harness.fire("session_start");
+
+      expect(harness.tools.map((tool) => tool.name)).toEqual(["list_agents", "send_message"]);
+      expect(harness.statuses).toHaveLength(1);
+      expect(existsSync(join(sessionsDir, `${process.pid}.json`))).toBe(true);
+
+      await harness.fire("session_shutdown");
+      expect(existsSync(join(sessionsDir, `${process.pid}.json`))).toBe(false);
+    });
+  });
+
   test.serial(
     "supports discovery, bidirectional messaging, statuses, and shutdown over real sockets",
     async () => {
@@ -497,6 +515,37 @@ describe("pi-bridge opt-in", () => {
     });
   });
 
+  test.serial("preserves a replacement raced after a status rewrite", async () => {
+    await withTestPaths(async ({ sessionsDir }) => {
+      const harness = createHarness(true);
+      piBridge(harness.pi as never, {
+        connectSocket: undefined,
+        platform: {
+          ...nodePlatform,
+          rename(temporaryPath, recordPath) {
+            nodePlatform.rename(temporaryPath, recordPath);
+            const replacement = readFileSync(recordPath, "utf8");
+            rmSync(recordPath);
+            writeFileSync(recordPath, replacement, { mode: 0o600 });
+          },
+        },
+      });
+      await harness.fire("session_start");
+      const recordPath = join(sessionsDir, `${process.pid}.json`);
+
+      await harness.fire("agent_start");
+      const replacementContents = readFileSync(recordPath, "utf8");
+      const replacementIdentity = statSync(recordPath);
+      await harness.fire("session_shutdown");
+
+      expect(readFileSync(recordPath, "utf8")).toBe(replacementContents);
+      expect(statSync(recordPath)).toMatchObject({
+        dev: replacementIdentity.dev,
+        ino: replacementIdentity.ino,
+      });
+    });
+  });
+
   test.serial("preserves a live replacement at its published socket path", async () => {
     await withTestPaths(async ({ sessionsDir }) => {
       const harness = createHarness(true);
@@ -563,6 +612,7 @@ describe("pi-bridge opt-in", () => {
           );
           return socket;
         },
+        platform: undefined,
       });
 
       await harness.fire("session_start");
@@ -606,6 +656,7 @@ describe("pi-bridge opt-in", () => {
           setImmediate(() => socket.emit("timeout"));
           return socket;
         },
+        platform: undefined,
       });
 
       await harness.fire("session_start");
@@ -759,6 +810,59 @@ describe("pi-bridge opt-in", () => {
       await harness.fire("session_start");
 
       expect(statSync(sessionsDir).mode & 0o777).toBe(0o755);
+      await harness.fire("session_shutdown");
+    });
+  });
+
+  test.serial("rolls back a controlled platform startup failure", async () => {
+    await withTestPaths(async ({ root }) => {
+      const harness = createHarness(true);
+      piBridge(harness.pi as never, {
+        connectSocket: undefined,
+        platform: {
+          ...nodePlatform,
+          async listenServer() {
+            throw new Error("controlled server failure");
+          },
+        },
+      });
+
+      await harness.fire("session_start");
+
+      expect(harness.tools).toEqual([]);
+      expect(harness.statuses).toEqual([]);
+      expect(harness.notifications).toEqual([
+        expect.objectContaining({
+          level: "error",
+          message: expect.stringContaining("controlled server failure"),
+        }),
+      ]);
+      expect(existsSync(join(root, ".claude"))).toBe(false);
+      expect(existsSync(join(root, "runtime"))).toBe(false);
+    });
+  });
+
+  test.serial("renders injected outbound socket errors as rejected tool calls", async () => {
+    await withTestPaths(async ({ root }) => {
+      const harness = createHarness(true);
+      piBridge(harness.pi as never, {
+        connectSocket() {
+          const socket = new Socket();
+          setImmediate(() => socket.emit("error", new Error("controlled transport failure")));
+          return socket;
+        },
+        platform: undefined,
+      });
+      await harness.fire("session_start");
+
+      const sendMessage = harness.tools.find((tool) => tool.name === "send_message");
+      await expect(
+        sendMessage?.execute("outbound-failure", {
+          to: `uds:${join(root, "missing.sock")}`,
+          message: "hello",
+        }),
+      ).rejects.toThrow("controlled transport failure");
+
       await harness.fire("session_shutdown");
     });
   });

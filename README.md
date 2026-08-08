@@ -41,6 +41,8 @@ is observational and does not perform cleanup.
 
 ## Development
 
+The enabled bridge uses stable Effect 3 to own one scoped lifecycle. Its internal Node platform boundary makes filesystem and Unix-socket failures controllable in tests, while record and protocol decisions remain deterministic.
+
 ```sh
 bun install
 bun run check
