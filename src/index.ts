@@ -19,6 +19,7 @@ import { randomUUID } from "node:crypto";
 
 const SESSIONS_DIR = join(homedir(), ".claude", "sessions");
 const PROBE_TIMEOUT_MS = 250;
+const MAX_PEER_FRAME_BYTES = 1_048_576;
 
 type SessionRecord = {
   pid: number;
@@ -238,18 +239,57 @@ export default function piBridge(pi: ExtensionAPI): void {
 
     server = createServer({ allowHalfOpen: true }, (conn) => {
       connections.add(conn);
-      let buffer = "";
+      let pendingFrame = Buffer.alloc(0);
+      let rejected = false;
+
+      const rejectOversizedFrame = () => {
+        if (rejected) return;
+        rejected = true;
+        pendingFrame = Buffer.alloc(0);
+        ctx.ui.notify(
+          `pi-bridge: peer frame exceeds ${MAX_PEER_FRAME_BYTES} byte limit`,
+          "warning",
+        );
+        conn.destroy();
+      };
+
+      const appendToPendingFrame = (bytes: Buffer): boolean => {
+        const nextLength = pendingFrame.length + bytes.length;
+        if (nextLength > MAX_PEER_FRAME_BYTES) {
+          rejectOversizedFrame();
+          return false;
+        }
+        if (bytes.length === 0) return true;
+        pendingFrame =
+          pendingFrame.length === 0
+            ? Buffer.from(bytes)
+            : Buffer.concat([pendingFrame, bytes], nextLength);
+        return true;
+      };
+
+      const processPendingFrame = () => {
+        const line = pendingFrame.toString("utf8");
+        pendingFrame = Buffer.alloc(0);
+        if (line.trim()) handleLine(line, ctx);
+      };
+
       conn.on("data", (chunk) => {
-        buffer += chunk.toString();
-        let index: number;
-        while ((index = buffer.indexOf("\n")) !== -1) {
-          const line = buffer.slice(0, index);
-          buffer = buffer.slice(index + 1);
-          if (line.trim()) handleLine(line, ctx);
+        let offset = 0;
+        while (offset < chunk.length && !rejected) {
+          const newlineIndex = chunk.indexOf(0x0a, offset);
+          if (newlineIndex === -1) {
+            appendToPendingFrame(chunk.subarray(offset));
+            return;
+          }
+
+          if (!appendToPendingFrame(chunk.subarray(offset, newlineIndex))) return;
+          processPendingFrame();
+          offset = newlineIndex + 1;
         }
       });
       conn.on("end", () => {
-        if (buffer.trim()) handleLine(buffer, ctx);
+        if (rejected) return;
+        if (pendingFrame.length > 0) processPendingFrame();
         conn.end();
       });
       conn.on("close", () => connections.delete(conn));
