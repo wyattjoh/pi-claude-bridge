@@ -9,19 +9,9 @@
  *
  * The reverse-engineered protocol is documented in the cc-pi repository.
  */
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import {
-  chmodSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -69,9 +59,7 @@ function readRecords(): SessionRecord[] {
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
     try {
-      const record = JSON.parse(
-        readFileSync(join(SESSIONS_DIR, file), "utf8"),
-      ) as SessionRecord;
+      const record = JSON.parse(readFileSync(join(SESSIONS_DIR, file), "utf8")) as SessionRecord;
       if (typeof record.messagingSocketPath === "string") records.push(record);
     } catch {
       // A session record mid-write is not worth failing discovery over.
@@ -103,10 +91,8 @@ function resolveTarget(
   selfPid: number,
 ): { path: string; label: string } | { error: string } {
   const trimmed = to.trim();
-  if (trimmed.startsWith("uds:"))
-    return { path: trimmed.slice(4), label: trimmed };
-  if (trimmed.startsWith("/"))
-    return { path: trimmed, label: `uds:${trimmed}` };
+  if (trimmed.startsWith("uds:")) return { path: trimmed.slice(4), label: trimmed };
+  if (trimmed.startsWith("/")) return { path: trimmed, label: `uds:${trimmed}` };
 
   const match = /^(.*?)\s*\[([0-9a-f]+)\]$/.exec(trimmed);
   const wantedName = (match?.[1] ?? trimmed).trim();
@@ -124,9 +110,7 @@ function resolveTarget(
       error: `No peer named '${wantedName}'. Run list_agents to see current peers.`,
     };
   if (candidates.length > 1) {
-    const refs = candidates
-      .map((record) => `${record.name} [${ref(record)}]`)
-      .join(", ");
+    const refs = candidates.map((record) => `${record.name} [${ref(record)}]`).join(", ");
     return {
       error: `'${wantedName}' is ambiguous. Re-send with a ref: ${refs}`,
     };
@@ -154,14 +138,12 @@ function sendFrame(socketPath: string, frame: PeerFrame): Promise<void> {
  */
 export default function ccPeer(pi: ExtensionAPI): void {
   pi.registerFlag("claude-peer", {
-    description:
-      "Make this pi session addressable from Claude Code peer messaging",
+    description: "Make this pi session addressable from Claude Code peer messaging",
     type: "boolean",
     default: false,
   });
   pi.registerFlag("cc-name", {
-    description:
-      "Peer name this pi session advertises when --claude-peer is enabled",
+    description: "Peer name this pi session advertises when --claude-peer is enabled",
     type: "string",
   });
 
@@ -173,11 +155,7 @@ export default function ccPeer(pi: ExtensionAPI): void {
   let startedAt = 0;
   let server: Server | undefined;
   const connections = new Set<Socket>();
-  let name =
-    `pi-${basename(process.cwd()).replace(/[^A-Za-z0-9_-]/g, "-")}-${pid}`.slice(
-      0,
-      80,
-    );
+  let name = `pi-${basename(process.cwd()).replace(/[^A-Za-z0-9_-]/g, "-")}-${pid}`.slice(0, 80);
   let streaming = false;
   let toolsRegistered = false;
 
@@ -224,10 +202,7 @@ export default function ccPeer(pi: ExtensionAPI): void {
     try {
       frame = JSON.parse(line);
     } catch {
-      ctx.ui.notify(
-        `cc-peer: unparseable frame: ${line.slice(0, 120)}`,
-        "warning",
-      );
+      ctx.ui.notify(`cc-peer: unparseable frame: ${line.slice(0, 120)}`, "warning");
       return;
     }
 
@@ -241,8 +216,7 @@ export default function ccPeer(pi: ExtensionAPI): void {
     if (frame.type !== "user") return;
 
     const message = frame.message as { content?: unknown } | undefined;
-    const content =
-      typeof message?.content === "string" ? message.content : undefined;
+    const content = typeof message?.content === "string" ? message.content : undefined;
     if (!content) return;
 
     // Claude wraps the body in <cross-session-message from="uds:..."> already, which
@@ -333,9 +307,7 @@ export default function ccPeer(pi: ExtensionAPI): void {
             (await isLive(record.messagingSocketPath)) ? record : undefined,
           ),
         );
-        const peers = live.filter(
-          (record): record is SessionRecord => record !== undefined,
-        );
+        const peers = live.filter((record): record is SessionRecord => record !== undefined);
         if (peers.length === 0) {
           return {
             content: [{ type: "text", text: "No live peer sessions." }],

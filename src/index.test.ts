@@ -38,8 +38,7 @@ describe("cc-peer opt-in", () => {
 
     expect(harness.flags.get("claude-peer")).toEqual({
       default: false,
-      description:
-        "Make this pi session addressable from Claude Code peer messaging",
+      description: "Make this pi session addressable from Claude Code peer messaging",
       type: "boolean",
     });
     expect(harness.tools).toEqual([]);

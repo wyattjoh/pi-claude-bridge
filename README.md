@@ -37,7 +37,10 @@ session records or create any files, sockets, or tools.
 ```sh
 bun install
 bun run check
+bunx lefthook install
 ```
+
+The pre-commit hook checks staged JavaScript and TypeScript files with Oxfmt and Oxlint. Use `git commit --no-verify` to bypass it in an emergency, or `bunx lefthook uninstall` to remove the installed hook.
 
 To try the local extension without installing the package:
 
