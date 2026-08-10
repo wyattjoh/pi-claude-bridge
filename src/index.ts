@@ -1,5 +1,5 @@
 /**
- * pi-bridge makes an opt-in Pi session addressable from Claude Code's
+ * pi-claude-bridge makes an opt-in Pi session addressable from Claude Code's
  * cross-session messaging tools. The bridge creates a Claude-compatible record
  * and newline-delimited JSON Unix socket only after `--bridge` is enabled.
  */
@@ -54,11 +54,11 @@ export default function piBridge(
       name: "list_agents",
       label: "List agents",
       description:
-        "List live peer sessions on this machine (Claude Code sessions and other pi-bridge sessions). " +
+        "List live peer sessions on this machine (Claude Code sessions and other pi-claude-bridge sessions). " +
         "Returns each peer's name, ref, status, and working directory. Use the name as the 'to' argument of send_message.",
       parameters: Type.Object({}),
       async execute() {
-        if (!runtime || !bridge) throw new Error("pi-bridge is not ready");
+        if (!runtime || !bridge) throw new Error("pi-claude-bridge is not ready");
         const peers = await runtime.runPromise(bridge.listPeers());
         if (peers.length === 0) {
           return { content: [{ type: "text", text: "No live peer sessions." }], details: {} };
@@ -88,7 +88,7 @@ export default function piBridge(
         message: Type.String({ description: "Message body" }),
       }),
       async execute(_toolCallId, params) {
-        if (!runtime || !bridge || !params) throw new Error("pi-bridge is not ready");
+        if (!runtime || !bridge || !params) throw new Error("pi-claude-bridge is not ready");
         try {
           const delivery = await runtime.runPromise(bridge.sendMessage(params.to, params.message));
           return {
@@ -139,17 +139,17 @@ export default function piBridge(
         runtime?.runCallback(nextBridge.receiveLine(line), {
           onExit: (exit) => {
             if (exit._tag === "Failure") {
-              ctx.ui.notify("pi-bridge: failed to process peer frame", "warning");
+              ctx.ui.notify("pi-claude-bridge: failed to process peer frame", "warning");
             }
           },
         });
       };
       registerTools();
-      ctx.ui.setStatus("pi-bridge", `peer: ${nextBridge.name}`);
+      ctx.ui.setStatus("pi-claude-bridge", `peer: ${nextBridge.name}`);
     } catch (error) {
       await nextRuntime.dispose();
       const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`pi-bridge: startup failed, bridge disabled: ${message}`, "error");
+      ctx.ui.notify(`pi-claude-bridge: startup failed, bridge disabled: ${message}`, "error");
     } finally {
       starting = false;
     }

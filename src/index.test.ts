@@ -247,7 +247,7 @@ function writePeer(
 }
 
 async function withTestPaths(run: (paths: TestPaths) => Promise<void>): Promise<void> {
-  const root = mkdtempSync(join(tmpdir(), "pi-bridge-test-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-claude-bridge-test-"));
   const previousEnvironment = {
     CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
     HOME: process.env.HOME,
@@ -274,7 +274,7 @@ async function withTestPaths(run: (paths: TestPaths) => Promise<void>): Promise<
   }
 }
 
-describe("pi-bridge opt-in", () => {
+describe("pi-claude-bridge opt-in", () => {
   test.serial("stays inactive unless --bridge is provided", async () => {
     await withTestPaths(async ({ root }) => {
       const harness = createHarness();
@@ -357,7 +357,7 @@ describe("pi-bridge opt-in", () => {
       expect(typeof record.updatedAt).toBe("number");
       expect(typeof record.statusUpdatedAt).toBe("number");
       expect(harness.statuses).toEqual([
-        { key: "pi-bridge", value: `peer: ${String(record.name)}` },
+        { key: "pi-claude-bridge", value: `peer: ${String(record.name)}` },
       ]);
 
       await harness.fire("session_shutdown");
@@ -996,7 +996,7 @@ describe("pi-bridge opt-in", () => {
 });
 
 describe("peer frame byte stream", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-bridge-frame-test-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-claude-bridge-frame-test-"));
   const sessionsDir = join(root, ".claude", "sessions");
   const previousEnvironment = {
     CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
@@ -1054,7 +1054,7 @@ describe("peer frame byte stream", () => {
     expect(harness.notifications).toEqual([
       {
         level: "warning",
-        message: `pi-bridge: peer frame exceeds ${MAX_PEER_FRAME_BYTES} byte limit`,
+        message: `pi-claude-bridge: peer frame exceeds ${MAX_PEER_FRAME_BYTES} byte limit`,
       },
     ]);
   });
@@ -1102,7 +1102,7 @@ describe("peer frame byte stream", () => {
 
     expect(harness.userMessages).toEqual([]);
     expect(harness.notifications).toEqual([
-      { level: "warning", message: "pi-bridge: unparseable frame: not-json" },
+      { level: "warning", message: "pi-claude-bridge: unparseable frame: not-json" },
     ]);
   });
 
@@ -1113,7 +1113,7 @@ describe("peer frame byte stream", () => {
     expect(harness.notifications).toEqual([
       {
         level: "warning",
-        message: `pi-bridge: peer frame exceeds ${MAX_PEER_FRAME_BYTES} byte limit`,
+        message: `pi-claude-bridge: peer frame exceeds ${MAX_PEER_FRAME_BYTES} byte limit`,
       },
     ]);
     expect(harness.notifications[0]?.message.length).toBeLessThan(200);

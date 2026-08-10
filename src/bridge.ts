@@ -86,7 +86,10 @@ class BridgeFailure extends Data.TaggedError("BridgeFailure")<{
 /**
  * The single Effect service that owns the opt-in bridge lifecycle and peer operations.
  */
-export class Bridge extends Context.Tag("@wyattjoh/pi-bridge/Bridge")<Bridge, BridgeOperations>() {}
+export class Bridge extends Context.Tag("@wyattjoh/pi-claude-bridge/Bridge")<
+  Bridge,
+  BridgeOperations
+>() {}
 
 /**
  * Creates the scoped Bridge layer for one enabled Pi session.
@@ -150,7 +153,10 @@ function acquireBridge(
 
 function bridgeFailure(operation: string, cause: unknown): BridgeFailure {
   const detail = cause instanceof Error ? cause.message : String(cause);
-  return new BridgeFailure({ message: `pi-bridge: ${operation} failed: ${detail}`, operation });
+  return new BridgeFailure({
+    message: `pi-claude-bridge: ${operation} failed: ${detail}`,
+    operation,
+  });
 }
 
 function resolveSessionsDirectory(platform: NodePlatform): string {
@@ -637,12 +643,12 @@ async function startBridge(configuration: BridgeConfiguration): Promise<{
       if (!isRecord(parsed)) return;
       frame = parsed;
     } catch {
-      host.notify(`pi-bridge: unparseable frame: ${line.slice(0, 120)}`, "warning");
+      host.notify(`pi-claude-bridge: unparseable frame: ${line.slice(0, 120)}`, "warning");
       return;
     }
     if (frame.action === "peer_message_status") {
       host.notify(
-        `pi-bridge: delivery ${String(frame.status)} for ${String(frame.orig_msg_id ?? "")}`,
+        `pi-claude-bridge: delivery ${String(frame.status)} for ${String(frame.orig_msg_id ?? "")}`,
         "info",
       );
       return;
@@ -662,7 +668,10 @@ async function startBridge(configuration: BridgeConfiguration): Promise<{
         if (rejected) return;
         rejected = true;
         pendingFrame = Buffer.alloc(0);
-        host.notify(`pi-bridge: peer frame exceeds ${MAX_PEER_FRAME_BYTES} byte limit`, "warning");
+        host.notify(
+          `pi-claude-bridge: peer frame exceeds ${MAX_PEER_FRAME_BYTES} byte limit`,
+          "warning",
+        );
         platform.destroySocket(connection);
       };
       const appendToPendingFrame = (bytes: Buffer): boolean => {
@@ -726,7 +735,7 @@ async function startBridge(configuration: BridgeConfiguration): Promise<{
     if (!activeServer) throw new Error("server did not start");
     platform.unrefServer(activeServer);
     platform.onServerError(activeServer, (error) =>
-      host.notify(`pi-bridge: server error: ${error.message}`, "error"),
+      host.notify(`pi-claude-bridge: server error: ${error.message}`, "error"),
     );
     publishInitialRecord();
   } catch (error) {
@@ -775,7 +784,7 @@ async function startBridge(configuration: BridgeConfiguration): Promise<{
         if (statusDegradationWarned) return;
         statusDegradationWarned = true;
         const detail = error instanceof Error ? error.message : String(error);
-        throw new Error(`pi-bridge: session status updates degraded: ${detail}`);
+        throw new Error(`pi-claude-bridge: session status updates degraded: ${detail}`);
       }
     },
   };
