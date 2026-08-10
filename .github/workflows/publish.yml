@@ -1,21 +1,43 @@
-name: Publish to npm
+name: Release Please
 
 on:
-  release:
-    types:
-      - published
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: npm-${{ github.event.release.tag_name }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
   publish:
-    name: Publish
-    if: ${{ !github.event.release.prerelease }}
+    name: Publish to npm
+    needs: release
+    if: ${{ needs.release.outputs.releases_created == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: npm
@@ -27,7 +49,7 @@ jobs:
       - name: Check out release tag
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.release.outputs.tag_name }}
 
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -49,10 +71,12 @@ jobs:
 
       - name: Verify release tag
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.tag_name }}
         run: |
           version="$(node --print "require('./package.json').version")"
-          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
-            echo "Release tag ${GITHUB_REF_NAME} does not match package version ${version}." >&2
+          if [[ "${RELEASE_TAG}" != "v${version}" ]]; then
+            echo "Release tag ${RELEASE_TAG} does not match package version ${version}." >&2
             exit 1
           fi
 

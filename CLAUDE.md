@@ -13,7 +13,7 @@ opt-in Pi session to Claude Code peer messaging.
 
 ## Release
 
-Read `RELEASING.md` before publishing. Keep `.github/workflows/publish.yml` stable because npm trusted publishing binds to the exact workflow filename and `npm` environment.
+Read `RELEASING.md` before publishing. Release Please owns `package.json` versions, `.release-please-manifest.json`, changelog entries, tags, and GitHub Releases. Keep `.github/workflows/publish.yml` stable because npm trusted publishing binds to the exact workflow filename and `npm` environment.
 
 ## Effect Design
 
