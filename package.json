@@ -1,6 +1,6 @@
 {
   "name": "@wyattjoh/pi-claude-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Opt-in Pi extension for Claude Code peer messaging over a Unix socket",
   "keywords": [
     "claude-code",
