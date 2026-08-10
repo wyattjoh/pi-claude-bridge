@@ -9,7 +9,11 @@ opt-in Pi session to Claude Code peer messaging.
 
 - Preserve the opt-in boundary: peer discovery, tools, sockets, session records, and stale-record cleanup start only after `--bridge` is enabled.
 - Test lifecycle behavior through temporary configuration and runtime directories, never the developer's real home or Claude state.
-- Treat the standard project check and a package dry run as completion gates.
+- Treat `bun run release:check` as the completion gate.
+
+## Release
+
+Read `RELEASING.md` before publishing. Keep `.github/workflows/publish.yml` stable because npm trusted publishing binds to the exact workflow filename and `npm` environment.
 
 ## Effect Design
 
