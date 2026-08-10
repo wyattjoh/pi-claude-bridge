@@ -1,4 +1,10 @@
 {
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
-  "ignorePatterns": [".pi/**", ".pi-subagents/**", ".scratch/**", "CHANGELOG.md"]
+  "ignorePatterns": [
+    ".pi/**",
+    ".pi-subagents/**",
+    ".scratch/**",
+    ".release-please-manifest.json",
+    "CHANGELOG.md"
+  ]
 }

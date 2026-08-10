@@ -16,8 +16,9 @@ trust policy and must remain `publish.yml` and `npm`.
 5. Push `main`. The Release Please workflow creates the initial `0.1.0` release
    pull request from the repository's Conventional Commit history.
 6. Bootstrap the npm package because npm only allows trusted publishing to be
-   configured for an existing package. Publish a temporary `0.0.0` package from
-   an isolated directory:
+   configured for an existing package. Do not run `npm publish` from the
+   repository checkout because that consumes the first Release Please version.
+   Publish a temporary `0.0.0` package from an isolated directory:
 
    ```sh
    npm login
