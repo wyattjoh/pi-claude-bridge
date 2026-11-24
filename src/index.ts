@@ -113,7 +113,8 @@ export default function piBridge(
 
     const host = {
       deliver(content: string) {
-        if (streaming) {
+        // A run that is still starting is busy before agent_start fires.
+        if (streaming || !ctx.isIdle()) {
           pi.sendUserMessage(content, { deliverAs: "followUp" });
           return;
         }
