@@ -56,6 +56,7 @@ function createHarness(
   const tools: ToolDefinition[] = [];
   const userMessages: Array<{ content: string; options: unknown }> = [];
   const userMessageListeners = new Set<(message: { content: string; options: unknown }) => void>();
+  let idle = true;
   const pi = {
     getFlag(name: string) {
       return name === "bridge" && bridgeEnabled;
@@ -78,6 +79,9 @@ function createHarness(
     },
   };
   const ctx = {
+    isIdle() {
+      return idle;
+    },
     ui: {
       notify(message: string, level: string) {
         notifications.push({ message, level });
@@ -103,6 +107,9 @@ function createHarness(
     flags,
     notifications,
     pi,
+    setIdle(value: boolean) {
+      idle = value;
+    },
     statuses,
     tools,
     userMessages,
@@ -478,6 +485,19 @@ describe("pi-claude-bridge opt-in", () => {
             content: "incoming while idle",
             options: undefined,
           });
+
+          harness.userMessages.length = 0;
+          harness.setIdle(false);
+          const startingMessage = harness.waitForUserMessage();
+          await sendSocketBytes(
+            ownRecord.messagingSocketPath,
+            `${peerFrame("incoming while starting")}\n`,
+          );
+          expect(await startingMessage).toEqual({
+            content: "incoming while starting",
+            options: { deliverAs: "followUp" },
+          });
+          harness.setIdle(true);
 
           await harness.fire("session_shutdown");
           await harness.fire("session_shutdown");
